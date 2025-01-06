@@ -20,7 +20,7 @@ LazyLlama is an implementation of [LazyLLM](https://arxiv.org/abs/2407.14057) to
 To use LazyLlama, you will need to have the following dependencies:
 
 - [PyTorch](https://pytorch.org/)
-- [Transformers](https://huggingface.co/transformers/)
+- [Transformers](https://huggingface.co/transformers/) (Warning! It seems that transformers v4.47.0 removed the kv cache from the decoder layer, therefore please use transformers v4.46.1) 
 - [Llama 2](https://huggingface.co/meta-llama/Llama-2-7b-chat-hf) family of models from Hugging Face
 
 ## Usage
