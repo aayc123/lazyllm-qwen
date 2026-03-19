@@ -55,10 +55,9 @@ class AuxCache:
         self.cache = tuple(torch.zeros(self.size, device=device) for _ in range(n_layers-1))
         self.cache_status_bit_array = torch.zeros((n_layers-1, sequence_length), dtype=torch.bool, device=device)
 
-class HFCache(StaticCache):
+class HFCache:
     """
-    A cache class that stores key-value (KV) caches compatible with Hugging Face's transformers.
-    This class is used for passing KV caches into the decoder layer.
+    替代原来继承StaticCache的版本，只实现Qwen3Attention.forward需要的update()方法
     """
     def __init__(
             self, 
@@ -66,20 +65,42 @@ class HFCache(StaticCache):
             device: torch.device, 
             cache: Optional[Tuple[torch.FloatTensor]] = None
         ):
-        """
-        Initializes an HFCache object.
-        
-        Args:
-            shape (Tuple[int]): Shape of the KV cache tensors in the format: (batch_size, num_heads, sequence_length, embed_size_per_head).
-            device (torch.device): Device to store the tensors (e.g., 'cpu' or 'cuda').
-            cache (Optional[Tuple[torch.FloatTensor]]): A tuple of two tensors (key_cache, value_cache) to initialize the cache.
-        """
-        self.shape = shape
+        # shape: (batch_size, num_heads, sequence_length, embed_size_per_head)
         self.max_cache_len = shape[2]
+        
         if cache is None:
-            self.key_cache = [torch.zeros(shape, device=device)]
-            self.value_cache = [torch.zeros(shape, device=device)]
+            self._key_cache = torch.zeros(shape, device=device)
+            self._value_cache = torch.zeros(shape, device=device)
+            self._current_len = 0
         else:
-            new_shape = (shape[0], shape[1], shape[2]-cache[0].shape[2], shape[3])
-            self.key_cache = [torch.cat([cache[0], torch.zeros(new_shape, device=device)], dim=2)]
-            self.value_cache = [torch.cat([cache[1], torch.zeros(new_shape, device=device)], dim=2)]
+            # cache[0]: (batch, heads, existing_len, head_dim)
+            existing_len = cache[0].shape[2]
+            pad_len = shape[2] - existing_len
+            pad_shape = (shape[0], shape[1], pad_len, shape[3])
+            self._key_cache = torch.cat([cache[0], torch.zeros(pad_shape, device=device)], dim=2)
+            self._value_cache = torch.cat([cache[1], torch.zeros(pad_shape, device=device)], dim=2)
+            self._current_len = existing_len
+
+        # 兼容原来代码里访问 local_kv_cache.key_cache[0] 的地方
+        self.key_cache = [self._key_cache]
+        self.value_cache = [self._value_cache]
+
+    def update(
+            self,
+            key_states: torch.Tensor,
+            value_states: torch.Tensor,
+            layer_idx: int,          # Qwen3Attention传进来的，这里忽略（每个HFCache只管一层）
+            cache_kwargs: dict,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        把新的key/value写入cache，返回完整的key/value（历史+新的）
+        cache_position 指示新token写入的位置
+        """
+        cache_position = cache_kwargs["cache_position"]  # shape: (new_token_len,)
+        
+        self._key_cache[:, :, cache_position, :] = key_states
+        self._value_cache[:, :, cache_position, :] = value_states
+
+        # 返回到目前为止所有有效的key/value
+        new_len = cache_position[-1].item() + 1
+        return self._key_cache[:, :, :new_len, :], self._value_cache[:, :, :new_len, :]

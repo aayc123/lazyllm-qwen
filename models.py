@@ -1,9 +1,12 @@
 from typing import Optional, Union
-from config import LazyLlamaConfig
-from transformers import PreTrainedModel, LogitsProcessorList, LlamaConfig
-from transformers.models.llama.modeling_llama import (
-    LlamaRMSNorm, LlamaRotaryEmbedding, _prepare_4d_causal_attention_mask_with_cache_position
+from transformers import PreTrainedModel, LogitsProcessorList
+from transformers.models.qwen3.modeling_qwen3 import (
+    Qwen3RMSNorm, Qwen3RotaryEmbedding
 )
+from transformers import Qwen3ForCausalLM, Qwen3Config, AutoTokenizer
+from config import LazyQwen3Config 
+from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
+from config import LazyQwen3Config
 import torch.nn as nn
 import torch
 from decoder_layer import DecoderLayer
@@ -19,14 +22,14 @@ def modify_key(key):
     else:
         return key
 
-class LazyLlamaModel(PreTrainedModel):
+class LazyQwen3Model(PreTrainedModel):
     """
-    A custom decoder-based model that builds upon the LlamaModel and implements dynamic token pruning.
+    A custom decoder-based model that builds upon the Qwen3Model and implements dynamic token pruning.
 
     This is an implementation of "LazyLLM: DYNAMIC TOKEN PRUNING FOR EFFICIENT LONG CONTEXT LLM INFERENCE"
-    with LLaMa 2 as the base model.
+    with Qwen3 as the base model.
     """
-    def __init__(self, config: LazyLlamaConfig):
+    def __init__(self, config: LazyQwen3Config):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -36,8 +39,8 @@ class LazyLlamaModel(PreTrainedModel):
             [DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
 
-        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen3RotaryEmbedding(config=config)
     
     def forward(
             self,
@@ -77,17 +80,26 @@ class LazyLlamaModel(PreTrainedModel):
         # so the sequence length is the position of the last hidden state + 1  
         sequence_length = cache_position[-1].item() + 1
 
-        causal_mask = _prepare_4d_causal_attention_mask_with_cache_position(
+        # mask_kwargs = dict(
+        #     config=self.config,
+        #     inputs_embeds=inputs_embeds,
+        #     attention_mask=attention_mask,
+        #     cache_position=torch.arange(sequence_length, device=device),
+        #     past_key_values=None,
+        # )
+        # causal_mask = {
+        #     "full_attention": create_causal_mask(**mask_kwargs),
+        # }
+        # if self.config.use_sliding_window:
+        #     causal_mask["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
+        
+        # 改成直接生成一个tensor，不用dict
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            sequence_length=sequence_length,
-            target_length=sequence_length,
-            dtype=dtype,
-            device=device,
-            min_dtype=torch.finfo(dtype).min,
-            # The cache_position tensor only includes the positions of current hidden states, but
-            # we need the positions of all tokens in the sequence
             cache_position=torch.arange(sequence_length, device=device),
-            batch_size=batch_size,
+            past_key_values=None,
         )
 
         context = Context(
@@ -117,42 +129,25 @@ class LazyLlamaModel(PreTrainedModel):
 
         return context.hidden_states, all_self_attns
     
-    def from_llama_state_dict(
-            llama_state_dict: OrderedDict, 
-            config: Union[LlamaConfig, LazyLlamaConfig], 
-            pruning_rates: Optional[dict] = None
-        ):
-        """
-        Initializes the LazyLlamaModel from a state dict of a LlamaModel.
-        
-        Args:
-            llama_state_dict (OrderedDict): The state dict of the LlamaModel.
-            config (Union[LlamaConfig, LazyLlamaConfig]): The configuration of the LazyLlamaModel.
-            pruning_rates (Optional[dict]): The pruning rates for each layer. Only required if `config` is an instance of LlamaConfig.
-        """
-        if isinstance(config, LlamaConfig):
-            config = LazyLlamaConfig.from_llama_config(pruning_rates, config)
-        elif not isinstance(config, LazyLlamaConfig):
-            raise ValueError("Config must be an instance of either LlamaConfig or LazyLlamaConfig.")
-            
-        new_state_dict = OrderedDict((modify_key(key), value) for key, value in llama_state_dict.items())
-
-        model = LazyLlamaModel(config)
+    def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
+        if isinstance(config, Qwen3Config):
+            config = LazyQwen3Config.from_qwen3_config(pruning_rates, config)
+        new_state_dict = OrderedDict((modify_key(k), v) for k, v in qwen3_state_dict.items())
+        model = LazyQwen3ForCausalLM(config)
         model.load_state_dict(new_state_dict)
-
         return model
     
-class LazyLlamaForCausalLM(PreTrainedModel):
+class LazyQwen3ForCausalLM(PreTrainedModel):
     """
-    A custom decoder-based model that builds upon the LlamaModel and implements dynamic token pruning.
+    A custom decoder-based model that builds upon the Qwen3Model and implements dynamic token pruning.
 
     This is an implementation of "LazyLLM: DYNAMIC TOKEN PRUNING FOR EFFICIENT LONG CONTEXT LLM INFERENCE"
-    with LLaMa 2 as the base model. It is specifically designed for causal language modeling tasks and it 
+    with Qwen3 as the base model. It is specifically designed for causal language modeling tasks and it
     implements a custom generate method.
     """
     def __init__(self, config):
         super().__init__(config)
-        self.model = LazyLlamaModel(config)
+        self.model = LazyQwen3Model(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -227,7 +222,7 @@ class LazyLlamaForCausalLM(PreTrainedModel):
         output_sequence = input_ids
 
         batch_size = input_ids.shape[0]
-        embed_size_per_head = self.config.hidden_size // self.config.num_attention_heads
+        embed_size_per_head = self.config.head_dim
         
         if logits_processor is None:
             logits_processor = LogitsProcessorList()
@@ -304,27 +299,10 @@ class LazyLlamaForCausalLM(PreTrainedModel):
             
         return output_sequence
     
-    def from_llama_state_dict(
-            llama_state_dict: OrderedDict, 
-            config: Union[LazyLlamaConfig, LlamaConfig], 
-            pruning_rates: Optional[dict] = None
-        ):
-        """
-        Initializes the LazyLlamaForCausalLM from a state dict of a LlamaModel.
-        
-        Args:
-            llama_state_dict (OrderedDict): The state dict of the LlamaModel.
-            config (Union[LlamaConfig, LazyLlamaConfig]): The configuration of the LazyLlamaModel.
-            pruning_rates (Optional[dict]): The pruning rates for each layer. Only required if `config` is an instance of LlamaConfig.
-        """
-        if isinstance(config, LlamaConfig):
-            config = LazyLlamaConfig.from_llama_config(pruning_rates, config)
-        elif not isinstance(config, LazyLlamaConfig):
-            raise ValueError("Config must be an instance of either LlamaConfig or LazyLlamaConfig.")
-            
-        new_state_dict = OrderedDict((modify_key(key), value) for key, value in llama_state_dict.items())
-
-        model = LazyLlamaForCausalLM(config)
+    def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
+        if isinstance(config, Qwen3Config):
+            config = LazyQwen3Config.from_qwen3_config(pruning_rates, config)
+        new_state_dict = OrderedDict((modify_key(k), v) for k, v in qwen3_state_dict.items())
+        model = LazyQwen3ForCausalLM(config)  # ← 注意这里
         model.load_state_dict(new_state_dict)
-
         return model

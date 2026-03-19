@@ -158,7 +158,7 @@ class Context:
             new_kv_cache_idxs,
             torch.narrow(local_kv_cache.value_cache[0], 2, self.in_kv_cache_idxs.shape[0], new_kv_cache_idxs.shape[0])
         )
-
+    '''只存那些：被剪掉 & 下一层KV Cache里没有 & Aux Cache里也没有的token'''
     def update_aux_cache(self, to_prune_idxs: torch.LongTensor, layer_idx: int):
         """Updates the Aux Cache with the hidden states of the pruned tokens"""
         in_next_layer_kv_bit_array = self.kv_cache.cache_status_bit_array[layer_idx+1]

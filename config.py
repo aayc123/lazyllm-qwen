@@ -1,8 +1,8 @@
-from transformers import LlamaConfig
+from transformers import Qwen3Config
 
-class LazyLlamaConfig(LlamaConfig):
+class LazyQwen3Config(Qwen3Config):
     """
-    A configuration class that extends the LlamaConfig with support for pruning rates. 
+    A configuration class that extends the Qwen3Config with support for pruning rates. 
     Used for both LazyLlamaModel and LazyLlamaForCausalLM.
     """
     def __init__(
@@ -23,14 +23,8 @@ class LazyLlamaConfig(LlamaConfig):
         self.pruning_rates = pruning_rates
         super().__init__(**kwargs)
 
-    def from_llama_config(pruning_rates: dict, config: LlamaConfig):
-        """
-        Initializes a LazyLlamaConfig instance from an existing LlamaConfig.
-        
-        This method takes a base LlamaConfig object and creates a LazyLlamaConfig
-        by copying the existing configuration parameters and adding the pruning rates.
-        """
-        return LazyLlamaConfig(
+    def from_qwen3_config(pruning_rates, config: Qwen3Config):
+        return LazyQwen3Config(
             pruning_rates=pruning_rates,
             vocab_size=config.vocab_size,
             hidden_size=config.hidden_size,
@@ -38,19 +32,15 @@ class LazyLlamaConfig(LlamaConfig):
             num_hidden_layers=config.num_hidden_layers,
             num_attention_heads=config.num_attention_heads,
             num_key_value_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,           
             hidden_act=config.hidden_act,
             max_position_embeddings=config.max_position_embeddings,
-            initializer_range=config.initializer_range,
             rms_norm_eps=config.rms_norm_eps,
-            use_cache=config.use_cache,
-            pad_token_id=config.pad_token_id,
-            bos_token_id=config.bos_token_id,
-            eos_token_id=config.eos_token_id,
-            pretraining_tp=config.pretraining_tp,
-            tie_word_embeddings=config.tie_word_embeddings,
-            rope_theta=config.rope_theta,
             rope_scaling=config.rope_scaling,
             attention_bias=config.attention_bias,
             attention_dropout=config.attention_dropout,
-            mlp_bias=config.mlp_bias,
+            use_sliding_window=config.use_sliding_window,  
+            sliding_window=config.sliding_window,          
+            max_window_layers=config.max_window_layers,   
+            layer_types=config.layer_types,                
         )

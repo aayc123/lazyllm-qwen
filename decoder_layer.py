@@ -1,19 +1,18 @@
-from config import LazyLlamaConfig
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaRotaryEmbedding
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RotaryEmbedding
 import torch
 from context import Context
 import torch.nn as nn
 from typing import Tuple, Optional
-
+from config import LazyQwen3Config
 class DecoderLayer(nn.Module):
     """
-    A custom decoder layer that builds upon the LlamaDecoderLayer and implements dynamic token pruning.
+    A custom decoder layer that builds upon the Qwen3DecoderLayer and implements dynamic token pruning.
 
     This layer utilizes KV cache and Aux Cache to speed up the "time-to-first-token" (TTFT) of Hugging 
-    Face's LLaMa 2 implementation. Dynamic token pruning is used in each forward pass, based on attention 
+    Face's Qwen3 implementation. Dynamic token pruning is used in each forward pass, based on attention 
     importance scores and pruning rates defined in the configuration. 
     """
-    def __init__(self, config: LazyLlamaConfig, layer_idx: int):
+    def __init__(self, config: LazyQwen3Config, layer_idx: int):
         """
         Initializes the decoder layer.
 
@@ -25,15 +24,15 @@ class DecoderLayer(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
 
-        # The LlamaDecoderLayer needs the layer index to retrieve the correct KV Cache, however we only pass it the 
-        # KV Cache of the current layer. Therefore the layer index needs to be 0 for all LlamaDecoderLayers.
-        self.decoder = LlamaDecoderLayer(config, 0)
+        # The Qwen3DecoderLayer needs the layer index to retrieve the correct KV Cache, however we only pass it the 
+        # KV Cache of the current layer. Therefore the layer index needs to be 0 for all Qwen3DecoderLayers.
+        self.decoder = Qwen3DecoderLayer(config, 0)
 
     def forward(
             self,
             context: Context,
             causal_mask: torch.FloatTensor,
-            rotary_emb: LlamaRotaryEmbedding,
+            rotary_emb: Qwen3RotaryEmbedding,
             output_attentions: bool,
         ) -> Tuple[Context, Optional[torch.Tensor]]:
         """
@@ -51,35 +50,50 @@ class DecoderLayer(nn.Module):
 
         if self.layer_idx > 0:
             context.get_aux_cache(self.layer_idx)
-  
-        # Removing the columns corresponding to the tokens that were pruned
-        causal_mask = torch.index_select(causal_mask, 3, context.keys_idxs_to_tokens_idxs)
 
-        # Modifying the causal mask's rows to only include the tokens in hidden states, in correct order
-        causal_mask = torch.index_select(causal_mask, 2, context.hidden_states_idxs) 
+        '''
+            LLaMA 2 在 models.py 里用 _prepare_4d_causal_attention_mask_with_cache_position 
+            生成一个全局统一的 4D mask。
+            Qwen3 引入了 Sliding Window Attention,
+            Qwen3DecoderLayer 内部会根据当前层的 layer_type(full_attention 或 sliding_attention)
+            自己选择 mask。
+            最简单的处理方式：把 causal_mask 从一个 tensor 变成一个 dict,分别存两种 mask
+        '''
+        causal_mask = torch.index_select(causal_mask, 3, context.keys_idxs_to_tokens_idxs)
+        causal_mask = torch.index_select(causal_mask, 2, context.hidden_states_idxs)
 
         position_embeddings = rotary_emb(context.hidden_states, context.hidden_states_positions)
 
-        new_hidden_states, attention_weights, new_local_kv_cache = self.decoder(
-            context.hidden_states,
+        residual = context.hidden_states
+        hidden_states = self.decoder.input_layernorm(context.hidden_states)
+
+        hidden_states, attention_weights = self.decoder.self_attn(
+            hidden_states=hidden_states,
             attention_mask=causal_mask,
-            past_key_value=local_kv_cache,
-            output_attentions=True,
-            use_cache=True,
             position_embeddings=position_embeddings,
-            # The cache position is used to insert new keys and values into the cache. Since I just want them to be 
-            # appended to the end of the cache, I need to make sure they get inserted after the last token from KV cache.
+            past_key_values=local_kv_cache,
             cache_position=torch.arange(
                 context.in_kv_cache_idxs.shape[0],
-                context.hidden_states.shape[1] + context.in_kv_cache_idxs.shape[0], 
+                context.hidden_states.shape[1] + context.in_kv_cache_idxs.shape[0],
                 device=context.device
             ),
+            output_attentions=True,   # ← 关键，强制返回attention_weights
         )
 
-        context.hidden_states = new_hidden_states
+        hidden_states = residual + hidden_states
 
-        context.update_kv_cache(new_local_kv_cache, self.layer_idx)
+        residual = hidden_states
+        hidden_states = self.decoder.post_attention_layernorm(hidden_states)
+        hidden_states = self.decoder.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
+        context.hidden_states = hidden_states
+        context.update_kv_cache(local_kv_cache, self.layer_idx)
+        
+        '''
+        取出最后一个 token 对所有其他 token 的 attention 权重，
+        在 batch 和 head 维度上取均值，得到每个 token 的重要性分数。
+        '''
         last_token_query_idx = context.tkns_idxs_to_hidden_states_idxs[-1]
         # The last token key's index will be the index of the last token in the hidden states, plus the number of tokens in the KV Cache.
         # This is because the KV Cache always comes before the hidden states in the attention mechanism.
@@ -87,7 +101,9 @@ class DecoderLayer(nn.Module):
 
         attn_weights_to_last_tkn = attention_weights[:, :, last_token_query_idx, :]
         importance_scores_list = torch.sum(attn_weights_to_last_tkn, dim=(0,1)) / (attention_weights.shape[0] * attention_weights.shape[1])
-
+        '''
+        用 torch.topk(..., largest=False) 选出重要性最低的 pruning_rate * N 个 token
+        '''
         pruning_rate = self.config.pruning_rates[self.layer_idx]
 
         if importance_scores_list.shape[0] > 1:
