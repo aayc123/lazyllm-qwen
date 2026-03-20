@@ -13,6 +13,7 @@ from decoder_layer import DecoderLayer
 from caches import KVCache, AuxCache
 from context import Context
 from collections import OrderedDict
+import time
 
 def modify_key(key):
     if "model.layers" in key:
@@ -126,7 +127,6 @@ class LazyQwen3Model(PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         context.hidden_states = self.norm(context.hidden_states)
-
         return context.hidden_states, all_self_attns
     
     def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
@@ -191,6 +191,7 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         hidden_states = outputs[0] 
         logits = self.lm_head(hidden_states)
         logits = logits.float()
+        # print(f"[DEBUG] logits shape: {logits.shape}")
 
         return logits, outputs[1] if output_attentions else None
     
@@ -261,10 +262,28 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         }
 
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-
+        is_prefill = True  # ← 加这行
+        prefill_time = 0   # ← 加这行
+        decode_times = []  # ← 加这行
         while cache_position[-1].item() < max_length and not torch.all(input_ids[:, -1] == eos_token_id):
+            torch.cuda.synchronize()
+            t_start = time.time()
             outputs = self(**model_inputs)
-
+            # ← 加计时结束
+            torch.cuda.synchronize()
+            t_end = time.time()
+            
+            # ← 记录时间
+            if is_prefill:
+                top5 = torch.topk(outputs[0][:, -1, :], 5)
+                print(f"[PREFILL TOP5] values: {top5.values}")
+                print(f"[PREFILL TOP5] indices: {top5.indices}")
+                prefill_time = t_end - t_start
+                is_prefill = False
+                print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms, 输入tokens: {cache_position[-1].item()+1}")
+            else:
+                decode_times.append(t_end - t_start)
+            
             next_token_logits = outputs[0][:, -1, :].clone()
             next_token_scores = logits_processor(input_ids, next_token_logits)
 
@@ -296,7 +315,13 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
                 "position_ids": position_ids,
                 "cache_position": cache_position,
             })
-            
+        if decode_times:
+            avg_decode = sum(decode_times) / len(decode_times) * 1000
+            total_decode = sum(decode_times) * 1000
+            print(f"[TIMER] Decode平均每token: {avg_decode:.1f}ms")
+            print(f"[TIMER] Decode总时间: {total_decode:.1f}ms, 共{len(decode_times)}个tokens")
+            print(f"[TIMER] 总时间(TTFT+Decode): {(prefill_time*1000+total_decode):.1f}ms")
+    
         return output_sequence
     
     def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):

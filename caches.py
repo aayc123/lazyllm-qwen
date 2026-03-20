@@ -102,5 +102,5 @@ class HFCache:
         self._value_cache[:, :, cache_position, :] = value_states
 
         # 返回到目前为止所有有效的key/value
-        new_len = cache_position[-1].item() + 1
+        new_len = cache_position.max().item() + 1
         return self._key_cache[:, :, :new_len, :], self._value_cache[:, :, :new_len, :]

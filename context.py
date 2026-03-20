@@ -103,7 +103,8 @@ class Context:
                 self.kv_cache.size[0], 
                 self.kv_cache.size[1], 
                 # The cache size must be equal to the number of selected tokens, because otherwise the attention mechanism will break
-                torch.nonzero(self.selected_tokens_bit_array).view(-1).shape[0], 
+                # torch.nonzero(self.selected_tokens_bit_array).view(-1).shape[0], 
+                self.kv_cache.size[2], 
                 self.kv_cache.size[3]
             ), 
             cache=cache,

@@ -72,14 +72,19 @@ class DecoderLayer(nn.Module):
             attention_mask=causal_mask,
             position_embeddings=position_embeddings,
             past_key_values=local_kv_cache,
-            cache_position=torch.arange(
-                context.in_kv_cache_idxs.shape[0],
-                context.hidden_states.shape[1] + context.in_kv_cache_idxs.shape[0],
-                device=context.device
-            ),
+            # cache_position=torch.arange(
+            #     context.in_kv_cache_idxs.shape[0],
+            #     context.hidden_states.shape[1] + context.in_kv_cache_idxs.shape[0],
+            #     device=context.device
+            # ),
+            cache_position=context.hidden_states_idxs,
             output_attentions=True,   # ← 关键，强制返回attention_weights
         )
-
+        # if self.layer_idx == 0:
+        #     print(f"[DEBUG] context.hidden_states.shape: {context.hidden_states.shape}")
+        #     print(f"[DEBUG] context.sequence_length: {context.sequence_length}")
+        #     print(f"[DEBUG] context.hidden_states_idxs: {context.hidden_states_idxs}")
+        
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -124,5 +129,11 @@ class DecoderLayer(nn.Module):
         
         if output_attentions:
             outputs += (attention_weights,)
-
+        if self.layer_idx == 0 and context.hidden_states.shape[1] > 1:
+            print(f"[PREFILL] importance_scores_list: {importance_scores_list}")
+            print(f"[PREFILL] last_token_query_idx: {last_token_query_idx}")
+            print(f"[PREFILL] last_token_key_idx: {last_token_key_idx}")
+            print(f"[PREFILL] to_prune_idxs: {to_prune_idxs}")
+            print(f"[PREFILL] attention_weights shape: {attention_weights.shape}")
+            print(f"[PREFILL] attn_weights_to_last_tkn: {attn_weights_to_last_tkn}")
         return outputs
