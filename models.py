@@ -42,6 +42,7 @@ class LazyQwen3Model(PreTrainedModel):
 
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
+        
     
     def forward(
             self,
@@ -73,70 +74,96 @@ class LazyQwen3Model(PreTrainedModel):
         
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
-
+        if inputs_embeds.shape[1] > 1:
+            print(f"[position_ids] shape={position_ids.shape}, first5={position_ids[0,:5].tolist()}, last5={position_ids[0,-5:].tolist()}")
         dtype, device = inputs_embeds.dtype, inputs_embeds.device 
         batch_size = inputs_embeds.shape[0]
 
         # The cache_position tensor stores positions of hidden states in the sequence,
         # so the sequence length is the position of the last hidden state + 1  
         sequence_length = cache_position[-1].item() + 1
-
-        # mask_kwargs = dict(
-        #     config=self.config,
-        #     inputs_embeds=inputs_embeds,
-        #     attention_mask=attention_mask,
-        #     cache_position=torch.arange(sequence_length, device=device),
-        #     past_key_values=None,
-        # )
-        # causal_mask = {
-        #     "full_attention": create_causal_mask(**mask_kwargs),
-        # }
-        # if self.config.use_sliding_window:
-        #     causal_mask["sliding_attention"] = create_sliding_window_causal_mask(**mask_kwargs)
-        
+        mask_full_length = attention_mask.shape[1]
         # 改成直接生成一个tensor，不用dict
         causal_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=torch.arange(sequence_length, device=device),
+            cache_position=torch.arange(mask_full_length, device=device),
             past_key_values=None,
         )
-
-        context = Context(
-            inputs_embeds,
-            kv_cache,
-            aux_cache,
-            position_ids,
-            cache_position,
-            sequence_length,
+        # NOTE: 使用 float32 的 mask 避免长序列下 bfloat16 在 SDPA 中产生 NaN
+        if causal_mask.dtype != torch.float32:
+            causal_mask = causal_mask.to(torch.float32)
+        # 检查是否需要sliding window mask（只生成一次，复用）
+        use_sw = (
+            hasattr(self.config, 'use_sliding_window') and
+            self.config.use_sliding_window and
+            self.config.sliding_window is not None
         )
-
+        sliding_window_mask = None
+        if use_sw:
+            sliding_window_mask = create_sliding_window_causal_mask(
+                config=self.config,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=torch.arange(mask_full_length, device=device),
+                past_key_values=None,
+                sliding_window=self.config.sliding_window,
+            )
+            if sliding_window_mask.dtype != torch.float32:
+                sliding_window_mask = sliding_window_mask.to(torch.float32)
+        
+        if inputs_embeds.shape[1] > 1:
+            print(f"[causal_mask] shape={causal_mask.shape}, ...")
+        
+        context = Context(
+            inputs_embeds, kv_cache, aux_cache,
+            position_ids, cache_position, sequence_length,
+        )
+        
         all_self_attns = () if output_attentions else None
-
-        for decoder_layer in self.layers:
+        
+        # ← 关键：合并成一个循环，按层选择对应mask
+        for layer_idx, decoder_layer in enumerate(self.layers):
+            if use_sw and layer_idx >= self.config.max_window_layers:
+                layer_causal_mask = sliding_window_mask
+            else:
+                layer_causal_mask = causal_mask
+            
             layer_outputs = decoder_layer(
                 context,
-                causal_mask,
+                layer_causal_mask,   # ← 传对应层的mask
                 self.rotary_emb,
                 output_attentions,
             )
             context = layer_outputs[0]
-
+            
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
-
+        
         context.hidden_states = self.norm(context.hidden_states)
+        self.last_hidden_states_idxs = context.hidden_states_idxs
         return context.hidden_states, all_self_attns
-    
+        
     def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
         if isinstance(config, Qwen3Config):
             config = LazyQwen3Config.from_qwen3_config(pruning_rates, config)
-        new_state_dict = OrderedDict((modify_key(k), v) for k, v in qwen3_state_dict.items())
-        model = LazyQwen3ForCausalLM(config)
-        model.load_state_dict(new_state_dict)
+        
+        new_state_dict = OrderedDict(
+            (modify_key(k), v) for k, v in qwen3_state_dict.items()
+        )
+        
+        # to_empty在CPU上分配空内存（不做随机初始化，比普通init省一半时间）
+        with torch.device("meta"):
+            model = LazyQwen3ForCausalLM(config)
+        
+        model = model.to_empty(device="cpu")
+        model.load_state_dict(new_state_dict, assign=True)
+        del new_state_dict
+        import gc; gc.collect()
+        
         return model
-    
+        
 class LazyQwen3ForCausalLM(PreTrainedModel):
     """
     A custom decoder-based model that builds upon the Qwen3Model and implements dynamic token pruning.
@@ -189,9 +216,16 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         )
 
         hidden_states = outputs[0] 
-        logits = self.lm_head(hidden_states)
+        if hidden_states.shape[1] > 1:
+            hidden_states_idxs = self.model.last_hidden_states_idxs  # 从model拿到idxs
+            last_pos_in_hidden = (hidden_states_idxs == hidden_states_idxs.max()).nonzero(as_tuple=True)[0][0]
+            last_token_hs = hidden_states[:, last_pos_in_hidden:last_pos_in_hidden+1, :]
+            print(f"[lm_head input] shape={hidden_states.shape}, last token stats: mean={last_token_hs[0,0,:].mean().item():.4f}, std={last_token_hs[0,0,:].std().item():.4f}, max={last_token_hs[0,0,:].max().item():.4f}")
+            print(f"[lm_head debug] hidden_states_idxs={hidden_states_idxs.tolist()}, last_pos_in_hidden={last_pos_in_hidden.item()}, max_idx={hidden_states_idxs.max().item()}")
+            logits = self.lm_head(last_token_hs)  # (1, 1, vocab_size)
+        else:
+            logits = self.lm_head(hidden_states)
         logits = logits.float()
-        # print(f"[DEBUG] logits shape: {logits.shape}")
 
         return logits, outputs[1] if output_attentions else None
     
@@ -205,6 +239,8 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             output_attentions: Optional[bool] = False, 
             logits_processor: Optional[LogitsProcessorList] = None,
             do_sample: Optional[bool] = False,
+            preallocated_kv_cache: Optional[object] = None,
+            preallocated_aux_cache: Optional[object] = None,
         ) -> torch.LongTensor:
         """
         Generates a sequence of tokens from a given prompt. It can be used for both greedy and sampling-based decoding.
@@ -220,6 +256,8 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             logits_processor (Optional[LogitsProcessorList]): A list of logits processors to apply to the logits.
             do_sample (Optional[bool]): Whether to use sampling-based decoding or not.
         """
+        # 每个 decode step 开始时
+        
         output_sequence = input_ids
 
         batch_size = input_ids.shape[0]
@@ -227,24 +265,38 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         
         if logits_processor is None:
             logits_processor = LogitsProcessorList()
-
-        kv_cache = KVCache(
-            self.config.num_hidden_layers,
-            batch_size,
-            self.config.num_key_value_heads,
-            max_length,
-            embed_size_per_head,
-            input_ids.device,
-        )
-
-        aux_cache = AuxCache(
-            self.config.num_hidden_layers,
-            batch_size,
-            max_length,
-            self.config.hidden_size,
-            input_ids.device,
-        )
-
+        
+        input_len = input_ids.shape[1]
+        max_new_tokens = max_length - input_len
+        # 限制最多生成200个新token（按你的dataset2maxlen来）
+        actual_max_length = input_len + min(max_new_tokens, 200)
+        if preallocated_kv_cache is not None:
+            kv_cache = preallocated_kv_cache
+            kv_cache.reset()
+        else:
+            kv_cache = KVCache(
+                self.config.num_hidden_layers,
+                batch_size,
+                self.config.num_key_value_heads,
+                actual_max_length,
+                embed_size_per_head,
+                input_ids.device,
+                dtype=torch.float32
+            )
+        if preallocated_aux_cache is not None:
+            aux_cache = preallocated_aux_cache
+            aux_cache.reset()
+        else:
+            aux_cache = AuxCache(
+                self.config.num_hidden_layers,
+                batch_size,
+                actual_max_length,
+                self.config.hidden_size,
+                input_ids.device,
+                dtype=torch.float32
+            )
+        print(f"KVCache dtype: {kv_cache.key_cache[0].dtype}")
+        print(f"AuxCache dtype: {aux_cache.cache[0].dtype}")
         cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
 
         # Creating position_ids on the fly. The default value (for padding tokens) is 1
@@ -260,74 +312,111 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             "position_ids": position_ids,
             "output_attentions": output_attentions, 
         }
-
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
         is_prefill = True  # ← 加这行
         prefill_time = 0   # ← 加这行
         decode_times = []  # ← 加这行
+        # is_first_step = True 
+        
         while cache_position[-1].item() < max_length and not torch.all(input_ids[:, -1] == eos_token_id):
             torch.cuda.synchronize()
             t_start = time.time()
-            outputs = self(**model_inputs)
-            # ← 加计时结束
-            torch.cuda.synchronize()
-            t_end = time.time()
-            
-            # ← 记录时间
-            if is_prefill:
-                top5 = torch.topk(outputs[0][:, -1, :], 5)
-                print(f"[PREFILL TOP5] values: {top5.values}")
-                print(f"[PREFILL TOP5] indices: {top5.indices}")
-                prefill_time = t_end - t_start
-                is_prefill = False
-                print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms, 输入tokens: {cache_position[-1].item()+1}")
-            else:
-                decode_times.append(t_end - t_start)
-            
-            next_token_logits = outputs[0][:, -1, :].clone()
-            next_token_scores = logits_processor(input_ids, next_token_logits)
+            with torch.no_grad():
+                outputs = self(**model_inputs)
+                # ← 加计时结束
+                torch.cuda.synchronize()
+                t_end = time.time()
+                # print(f"[step {'prefill' if is_prefill else len(decode_times)}] allocated: {torch.cuda.memory_allocated()/1024**3:.1f}GB, reserved: {torch.cuda.memory_reserved()/1024**3:.1f}GB")
 
-            if do_sample:
-                probs = nn.functional.softmax(next_token_scores, dim=-1)
-                next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
-            else:
-                next_tokens = torch.argmax(next_token_scores, dim=-1)
+                # ← 记录时间
+                if is_prefill:
+                    top5 = torch.topk(outputs[0][:, -1, :], 5)
+                    # print(f"[PREFILL TOP5] values: {top5.values}")
+                    # print(f"[PREFILL TOP5] indices: {top5.indices}")
+                    prefill_time = t_end - t_start
+                    is_prefill = False
+                    # print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms, 输入tokens: {cache_position[-1].item()+1}")
+                else:
+                    decode_times.append(t_end - t_start)
+                # if is_first_step:
+                #     kv = model_inputs['kv_cache']
+                #     aux = model_inputs['aux_cache']
+                #     is_first_step = False
+                next_token_logits = outputs[0][:, -1, :].clone()
+                # 找到这段诊断代码，替换为：
+                if is_prefill or len(decode_times) < 2:
+                    print(f"[logits] max={next_token_logits.max().item():.2f}, min={next_token_logits.min().item():.2f}, has_nan={next_token_logits.isnan().any().item()}, has_inf={next_token_logits.isinf().any().item()}")
+                    top3 = torch.topk(next_token_logits[0], 3)
+                    print(f"[logits] top3 ids={top3.indices.tolist()}, vals={[f'{v:.2f}' for v in top3.values.tolist()]}")
+                next_token_scores = logits_processor(input_ids, next_token_logits)
+                
+                if do_sample:
+                    probs = nn.functional.softmax(next_token_scores, dim=-1)
+                    next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+                else:
+                    next_tokens = torch.argmax(next_token_scores, dim=-1)
 
-            # Finished sentences should have their next token be a padding token
-            next_tokens = next_tokens * unfinished_sequences + (1 - unfinished_sequences) * pad_token_id
+                # Finished sentences should have their next token be a padding token
+                next_tokens = next_tokens * unfinished_sequences + (1 - unfinished_sequences) * pad_token_id
 
-            unfinished_sequences.mul_(next_tokens != eos_token_id)
+                unfinished_sequences.mul_(next_tokens != eos_token_id)
 
-            # Updating model inputs for the next generation step
-            input_ids = next_tokens.view(-1, 1) 
-            output_sequence = torch.cat([output_sequence, input_ids], dim=-1)             
-            cache_position = torch.tensor([cache_position[-1] + 1], device=cache_position.device)
-            attention_mask = torch.cat(
-                [attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)], 
-                dim=-1
-            )
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
+                # Updating model inputs for the next generation step
+                input_ids = next_tokens.view(-1, 1) 
+                output_sequence = torch.cat([output_sequence, input_ids], dim=-1)             
+                cache_position = torch.tensor([cache_position[-1] + 1], device=cache_position.device)
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)], 
+                    dim=-1
+                )
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 1)
 
-            model_inputs.update({
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-                "cache_position": cache_position,
-            })
+                model_inputs.update({
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                    "cache_position": cache_position,
+                })
         if decode_times:
             avg_decode = sum(decode_times) / len(decode_times) * 1000
             total_decode = sum(decode_times) * 1000
             print(f"[TIMER] Decode平均每token: {avg_decode:.1f}ms")
             print(f"[TIMER] Decode总时间: {total_decode:.1f}ms, 共{len(decode_times)}个tokens")
+            print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms")
             print(f"[TIMER] 总时间(TTFT+Decode): {(prefill_time*1000+total_decode):.1f}ms")
-    
+            
+        model_inputs.clear()
+
+        # 只有自己创建的才释放，预分配的不释放
+        if preallocated_kv_cache is None:
+            kv_cache.key_cache.clear()
+            kv_cache.value_cache.clear()
+            kv_cache.cache_status_bit_array = None
+            aux_cache.cache.clear()
+            aux_cache.cache_status_bit_array = None
+            del kv_cache, aux_cache
+
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
         return output_sequence
     
     def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
         if isinstance(config, Qwen3Config):
             config = LazyQwen3Config.from_qwen3_config(pruning_rates, config)
-        new_state_dict = OrderedDict((modify_key(k), v) for k, v in qwen3_state_dict.items())
-        model = LazyQwen3ForCausalLM(config)  # ← 注意这里
-        model.load_state_dict(new_state_dict)
+        
+        new_state_dict = OrderedDict(
+            (modify_key(k), v) for k, v in qwen3_state_dict.items()
+        )
+        
+        # to_empty在CPU上分配空内存（不做随机初始化，比普通init省一半时间）
+        with torch.device("meta"):
+            model = LazyQwen3ForCausalLM(config)
+        
+        model = model.to_empty(device="cpu")
+        model.load_state_dict(new_state_dict, assign=True)
+        del new_state_dict
+        import gc; gc.collect()
+        
         return model
+        

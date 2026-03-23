@@ -1,6 +1,7 @@
 import torch
 from caches import KVCache, AuxCache, HFCache
-
+a=0
+b=0
 class Context:
     """
     This class provides a way to manage the state of tokens inbetween the layers of the transformer model.
@@ -81,36 +82,34 @@ class Context:
         return bit_array
 
     def get_kv_cache(self, layer_idx: int) -> HFCache:
-        """Returns the KV cache for the given layer"""
-        in_kv_cache_bit_array = torch.logical_and(self.kv_cache.cache_status_bit_array[layer_idx], self.selected_tokens_bit_array)
+        in_kv_cache_bit_array = torch.logical_and(
+            self.kv_cache.cache_status_bit_array[layer_idx], 
+            self.selected_tokens_bit_array
+        )
         in_kv_cache_idxs = torch.nonzero(in_kv_cache_bit_array).view(-1)
 
         self.in_kv_cache_idxs = in_kv_cache_idxs
         self.in_kv_cache_bit_array = in_kv_cache_bit_array
-
         self._update_keys_idxs_to_tokens_idxs = True
 
-        if in_kv_cache_idxs.shape[0] == 0:
-            cache = None
-        else:
-            cache = (
-                torch.index_select(self.kv_cache.key_cache[layer_idx], 2, in_kv_cache_idxs),
-                torch.index_select(self.kv_cache.value_cache[layer_idx], 2, in_kv_cache_idxs),
-            )
-
+        total_size = torch.nonzero(self.selected_tokens_bit_array).view(-1).shape[0]
+        
+        # ✅ 不再 new tensor，直接用 KVCache 里 pre-allocated 的内存构造轻量 HFCache
         local_kv_cache = HFCache(
-            shape = (
+            shape=(
                 self.kv_cache.size[0], 
                 self.kv_cache.size[1], 
-                # The cache size must be equal to the number of selected tokens, because otherwise the attention mechanism will break
-                # torch.nonzero(self.selected_tokens_bit_array).view(-1).shape[0], 
-                self.kv_cache.size[2], 
+                total_size,
                 self.kv_cache.size[3]
-            ), 
-            cache=cache,
-            device=self.device
+            ),
+            # ✅ 传入已有的 pre-allocated buffer 的 view，避免额外分配
+            preallocated_key=self.kv_cache.key_cache[layer_idx],
+            preallocated_value=self.kv_cache.value_cache[layer_idx],
+            in_kv_cache_idxs=in_kv_cache_idxs,
+            total_size=total_size,
+            device=self.device,
+            dtype=self.kv_cache.key_cache[layer_idx].dtype
         )
-
         return local_kv_cache
 
     def get_aux_cache(self, layer_idx: int):
@@ -121,49 +120,58 @@ class Context:
             torch.logical_not(self.in_kv_cache_bit_array)
         )
         in_aux_cache_idxs = torch.nonzero(in_aux_cache_bit_array).view(-1)
-
+        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
+        #     print(f"[get_aux_cache layer{layer_idx}] aux_cache_status: {self.aux_cache.cache_status_bit_array[layer_idx-1].sum()}")
+        #     print(f"[get_aux_cache layer{layer_idx}] in_aux_cache_idxs: {in_aux_cache_idxs}")
+        
         self.hidden_states = torch.cat([
             self.hidden_states, 
             torch.index_select(self.aux_cache.cache[layer_idx-1], 1, in_aux_cache_idxs)
         ], dim=1)
 
         self.hidden_states_idxs = torch.cat([self.hidden_states_idxs, in_aux_cache_idxs], dim=0)
-
+        # ✅ 修复：sequence_length 应该等于当前选中的最大 token 索引 + 1
+        if in_aux_cache_idxs.shape[0] > 0:
+            self.sequence_length = max(
+                self.sequence_length,
+                int(self.hidden_states_idxs.max().item()) + 1
+            )
         self._update_keys_idxs_to_tokens_idxs = True
         self._update_tkns_idxs_to_hidden_states_idxs = True
+        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
+        #     print(f"[get_aux_cache layer{layer_idx}] hidden_states_idxs after: {self.hidden_states_idxs}")
+
 
     @property
     def hidden_states_positions(self):
         return self.tokens_positions_idxs[:, self.hidden_states_idxs]
 
-    def update_kv_cache(self, local_kv_cache: HFCache, layer_idx: int):
-        """Updates the KV Cache with the new keys and values"""
+    def update_kv_cache(self, local_kv_cache: HFCache, layer_idx: int, kv_cache_offset: int = None):
         in_hidden_states_bit_array = torch.logical_and(
-            self.selected_tokens_bit_array, 
+            self.hidden_states_bit_array,
             torch.logical_not(self.kv_cache.cache_status_bit_array[layer_idx])
         )
-
         self.kv_cache.cache_status_bit_array[layer_idx].logical_or_(in_hidden_states_bit_array)
-
         new_kv_cache_idxs = torch.nonzero(in_hidden_states_bit_array).view(-1)
 
-        # Mapping the new KV Caches from the HFCache, to the KVCache. The new caches in HFCache are subsequent to the old ones,
-        # therefore, we need to slice HFCache starting from "self.in_kv_cache_idxs.shape[0]" along the second dimension.
+        # ← 改用 index_select，按真实位置取值
         self.kv_cache.key_cache[layer_idx].index_copy_(
-            2, 
-            new_kv_cache_idxs, 
-            torch.narrow(local_kv_cache.key_cache[0], 2, self.in_kv_cache_idxs.shape[0], new_kv_cache_idxs.shape[0])
+            2,
+            new_kv_cache_idxs,
+            torch.index_select(local_kv_cache.key_cache[0], 2, new_kv_cache_idxs)
         )
         self.kv_cache.value_cache[layer_idx].index_copy_(
             2,
             new_kv_cache_idxs,
-            torch.narrow(local_kv_cache.value_cache[0], 2, self.in_kv_cache_idxs.shape[0], new_kv_cache_idxs.shape[0])
+            torch.index_select(local_kv_cache.value_cache[0], 2, new_kv_cache_idxs)
         )
+            
+            
     '''只存那些：被剪掉 & 下一层KV Cache里没有 & Aux Cache里也没有的token'''
     def update_aux_cache(self, to_prune_idxs: torch.LongTensor, layer_idx: int):
         """Updates the Aux Cache with the hidden states of the pruned tokens"""
         in_next_layer_kv_bit_array = self.kv_cache.cache_status_bit_array[layer_idx+1]
-
+        
         pruned_tokens_bit_array = torch.zeros_like(self.selected_tokens_bit_array)
         pruned_tokens_bit_array[to_prune_idxs] = True
         
@@ -174,7 +182,10 @@ class Context:
             # Removing those tokens that are in the next layer's KV Cache and those that are already in the Aux Cache
             torch.logical_not(torch.logical_or(in_next_layer_kv_bit_array, in_aux_cache_bit_array))
         ) 
-
+        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
+        #     print(f"[update_aux_cache layer{layer_idx}] hidden_states.shape: {self.hidden_states.shape}")
+        #     print(f"[update_aux_cache layer{layer_idx}] in_next_layer_kv sum: {in_next_layer_kv_bit_array.sum()}")
+        #     print(f"[update_aux_cache layer{layer_idx}] in_aux_cache sum before: {in_aux_cache_bit_array.sum()}")
         self.aux_cache.cache_status_bit_array[layer_idx].logical_or_(to_add_to_aux_bit_array)
 
         to_add_to_aux_idxs = torch.nonzero(to_add_to_aux_bit_array).view(-1)
@@ -185,6 +196,11 @@ class Context:
             to_add_to_aux_idxs, 
             torch.index_select(self.hidden_states, 1, self.tkns_idxs_to_hidden_states_idxs[to_add_to_aux_idxs])
         )
+        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
+        #     print(f"[update_aux_cache layer{layer_idx}] to_prune_idxs count: {to_prune_idxs.shape[0]}")
+        #     print(f"[update_aux_cache layer{layer_idx}] to_add_to_aux_idxs: {to_add_to_aux_idxs}")
+        #     print(f"[update_aux_cache layer{layer_idx}] aux status after: {self.aux_cache.cache_status_bit_array[layer_idx].sum()}")
+
 
     def prune(self, to_prune_idxs: torch.LongTensor):
         """Prunes the tokens from the hidden states"""
