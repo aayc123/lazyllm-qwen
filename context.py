@@ -49,6 +49,12 @@ class Context:
         
         max_sequence_length = kv_cache.size[2]
 
+        if int(sequence_length) > int(max_sequence_length):
+            raise ValueError(
+                f"Context sequence_length={int(sequence_length)} exceeds KVCache capacity={int(max_sequence_length)}. "
+                "Increase MAX_SEQ_LEN (prompt+generation) or truncate the prompt to leave generation budget."
+            )
+
         self.selected_tokens_bit_array = torch.zeros(max_sequence_length, device=self.device, dtype=torch.bool)
         self.selected_tokens_bit_array[torch.arange(sequence_length, device=self.device)] = True
 
@@ -82,24 +88,40 @@ class Context:
         return bit_array
 
     def get_kv_cache(self, layer_idx: int) -> HFCache:
-        in_kv_cache_bit_array = torch.logical_and(
-            self.kv_cache.cache_status_bit_array[layer_idx], 
-            self.selected_tokens_bit_array
-        )
-        in_kv_cache_idxs = torch.nonzero(in_kv_cache_bit_array).view(-1)
+        is_decode = self.hidden_states.shape[1] == 1
+        
+        if is_decode:
+            # decode阶段：直接取该层所有已有KV，不用selected过滤
+            in_kv_cache_idxs = torch.nonzero(
+                self.kv_cache.cache_status_bit_array[layer_idx]
+            ).view(-1)
+            in_kv_cache_bit_array = self.kv_cache.cache_status_bit_array[layer_idx].clone()
+        else:
+            # prefill阶段：原来的逻辑
+            in_kv_cache_bit_array = torch.logical_and(
+                self.kv_cache.cache_status_bit_array[layer_idx],
+                self.selected_tokens_bit_array
+            )
+            in_kv_cache_idxs = torch.nonzero(in_kv_cache_bit_array).view(-1)
 
         self.in_kv_cache_idxs = in_kv_cache_idxs
         self.in_kv_cache_bit_array = in_kv_cache_bit_array
         self._update_keys_idxs_to_tokens_idxs = True
 
-        total_size = torch.nonzero(self.selected_tokens_bit_array).view(-1).shape[0]
-        
-        # ✅ 不再 new tensor，直接用 KVCache 里 pre-allocated 的内存构造轻量 HFCache
+        # NOTE:
+        # 这里传给 HFCache 的 total_size 不能用“当前 key 的数量”。
+        # 因为 valid_idxs / cache_position 是 token 的“绝对索引”(0..sequence_length-1)，剪枝后这些索引会变稀疏，
+        # 此时 max(valid_idxs) 可能远大于 key 的数量，从而触发错误的 out-of-range 判断，甚至影响 HF attention 内部的长度检查。
+        # 因此 total_size 在本项目中代表“逻辑上允许的最大 token 索引范围”(max index + 1)，一般等于当前序列长度。
+        total_size = int(self.sequence_length)
+
+        # 使用 KVCache 的最大长度作为三维长度，保证与全局缓冲区形状一致；
+        # total_size 只作为“有效长度”元数据交给 HFCache 进行索引检查。
         local_kv_cache = HFCache(
             shape=(
                 self.kv_cache.size[0], 
                 self.kv_cache.size[1], 
-                total_size,
+                self.kv_cache.size[2],
                 self.kv_cache.size[3]
             ),
             # ✅ 传入已有的 pre-allocated buffer 的 view，避免额外分配
@@ -191,10 +213,15 @@ class Context:
         to_add_to_aux_idxs = torch.nonzero(to_add_to_aux_bit_array).view(-1)
 
         # Hidden states are stored in random order, so the tkns_idxs_to_hidden_states_idxs mapping is needed. 
+        aux_src = torch.index_select(
+            self.hidden_states, 1, self.tkns_idxs_to_hidden_states_idxs[to_add_to_aux_idxs]
+        )
+        if aux_src.dtype != self.aux_cache.cache[layer_idx].dtype:
+            aux_src = aux_src.to(self.aux_cache.cache[layer_idx].dtype)
         self.aux_cache.cache[layer_idx].index_copy_(
-            1, 
-            to_add_to_aux_idxs, 
-            torch.index_select(self.hidden_states, 1, self.tkns_idxs_to_hidden_states_idxs[to_add_to_aux_idxs])
+            1,
+            to_add_to_aux_idxs,
+            aux_src
         )
         # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
         #     print(f"[update_aux_cache layer{layer_idx}] to_prune_idxs count: {to_prune_idxs.shape[0]}")

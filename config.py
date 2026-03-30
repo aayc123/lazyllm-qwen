@@ -23,24 +23,17 @@ class LazyQwen3Config(Qwen3Config):
         self.pruning_rates = pruning_rates
         super().__init__(**kwargs)
 
+    @staticmethod
     def from_qwen3_config(pruning_rates, config: Qwen3Config):
-        return LazyQwen3Config(
-            pruning_rates=pruning_rates,
-            vocab_size=config.vocab_size,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            num_hidden_layers=config.num_hidden_layers,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            head_dim=config.head_dim,           
-            hidden_act=config.hidden_act,
-            max_position_embeddings=config.max_position_embeddings,
-            rms_norm_eps=config.rms_norm_eps,
-            rope_scaling=config.rope_scaling,
-            attention_bias=config.attention_bias,
-            attention_dropout=config.attention_dropout,
-            use_sliding_window=config.use_sliding_window,  
-            sliding_window=config.sliding_window,          
-            max_window_layers=config.max_window_layers,   
-            layer_types=config.layer_types,                
-        )
+        """从已有的 Qwen3Config 完整构造 LazyQwen3Config。
+
+        之前这里是手工挑字段拷贝，只保留了部分关键参数，
+        像 rope_theta、bos/eos/pad_token_id、use_cache 等很多配置都丢失，
+        会导致 Lazy 模型和原始 Qwen3 的行为不一致，从而严重影响生成质量。
+
+        现在直接基于 config.to_dict() 复制全部配置字段，仅额外加入 pruning_rates。
+        """
+        cfg_dict = config.to_dict()
+        # 避免重复字段冲突
+        cfg_dict.pop("pruning_rates", None)
+        return LazyQwen3Config(pruning_rates=pruning_rates, **cfg_dict)

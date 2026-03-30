@@ -14,6 +14,7 @@ from caches import KVCache, AuxCache
 from context import Context
 from collections import OrderedDict
 import time
+import os
 
 def modify_key(key):
     if "model.layers" in key:
@@ -84,35 +85,51 @@ class LazyQwen3Model(PreTrainedModel):
         sequence_length = cache_position[-1].item() + 1
         mask_full_length = attention_mask.shape[1]
         # 改成直接生成一个tensor，不用dict
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=torch.arange(mask_full_length, device=device),
-            past_key_values=None,
-        )
-        # NOTE: 使用 float32 的 mask 避免长序列下 bfloat16 在 SDPA 中产生 NaN
-        if causal_mask.dtype != torch.float32:
-            causal_mask = causal_mask.to(torch.float32)
-        # 检查是否需要sliding window mask（只生成一次，复用）
-        use_sw = (
-            hasattr(self.config, 'use_sliding_window') and
-            self.config.use_sliding_window and
-            self.config.sliding_window is not None
-        )
-        sliding_window_mask = None
-        if use_sw:
-            sliding_window_mask = create_sliding_window_causal_mask(
+        is_decode = inputs_embeds.shape[1] == 1
+
+        if is_decode:
+            # decode阶段：当前单token可以attend到所有past tokens
+            # shape: (batch, 1, 1, full_len)
+            causal_mask = torch.zeros(
+                (batch_size, 1, 1, mask_full_length),
+                dtype=torch.float32,
+                device=device,
+            )
+            # padding位置mask掉
+            if attention_mask is not None:
+                padding_mask = (attention_mask == 0).float() * -1e4  # (B, full_len)
+                causal_mask[:, :, 0, :] = padding_mask
+            use_sw = False
+            sliding_window_mask = None
+        else:
+            causal_mask = create_causal_mask(
                 config=self.config,
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 cache_position=torch.arange(mask_full_length, device=device),
                 past_key_values=None,
-                sliding_window=self.config.sliding_window,
             )
-            if sliding_window_mask.dtype != torch.float32:
-                sliding_window_mask = sliding_window_mask.to(torch.float32)
-        
+            if causal_mask.dtype != torch.float32:
+                causal_mask = causal_mask.to(torch.float32)
+            causal_mask = causal_mask.clamp(min=-1e4)
+            use_sw = (
+                hasattr(self.config, 'use_sliding_window') and
+                self.config.use_sliding_window and
+                self.config.sliding_window is not None
+            )
+            sliding_window_mask = None
+            if use_sw:
+                sliding_window_mask = create_sliding_window_causal_mask(
+                    config=self.config,
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    cache_position=torch.arange(mask_full_length, device=device),
+                    past_key_values=None,
+                    sliding_window=self.config.sliding_window,
+                )
+                if sliding_window_mask.dtype != torch.float32:
+                    sliding_window_mask = sliding_window_mask.to(torch.float32)
+                sliding_window_mask = sliding_window_mask.clamp(min=-1e4)
         if inputs_embeds.shape[1] > 1:
             print(f"[causal_mask] shape={causal_mask.shape}, ...")
         
@@ -161,6 +178,11 @@ class LazyQwen3Model(PreTrainedModel):
         model.load_state_dict(new_state_dict, assign=True)
         del new_state_dict
         import gc; gc.collect()
+
+        # meta -> to_empty 会让“未出现在 state_dict 里的 buffer”变成未初始化内存。
+        # Qwen3RotaryEmbedding 的 inv_freq/cos/sin cache 等属于这类 buffer，
+        # 若不重建，会导致 rotary_emb 输出 cos/sin=NaN，进而整网 NaN。
+        model.model.rotary_emb = Qwen3RotaryEmbedding(config=model.config)
         
         return model
         
@@ -220,8 +242,8 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             hidden_states_idxs = self.model.last_hidden_states_idxs  # 从model拿到idxs
             last_pos_in_hidden = (hidden_states_idxs == hidden_states_idxs.max()).nonzero(as_tuple=True)[0][0]
             last_token_hs = hidden_states[:, last_pos_in_hidden:last_pos_in_hidden+1, :]
-            print(f"[lm_head input] shape={hidden_states.shape}, last token stats: mean={last_token_hs[0,0,:].mean().item():.4f}, std={last_token_hs[0,0,:].std().item():.4f}, max={last_token_hs[0,0,:].max().item():.4f}")
-            print(f"[lm_head debug] hidden_states_idxs={hidden_states_idxs.tolist()}, last_pos_in_hidden={last_pos_in_hidden.item()}, max_idx={hidden_states_idxs.max().item()}")
+            # print(f"[lm_head input] shape={hidden_states.shape}, last token stats: mean={last_token_hs[0,0,:].mean().item():.4f}, std={last_token_hs[0,0,:].std().item():.4f}, max={last_token_hs[0,0,:].max().item():.4f}")
+            # print(f"[lm_head debug] hidden_states_idxs={hidden_states_idxs.tolist()}, last_pos_in_hidden={last_pos_in_hidden.item()}, max_idx={hidden_states_idxs.max().item()}")
             logits = self.lm_head(last_token_hs)  # (1, 1, vocab_size)
         else:
             logits = self.lm_head(hidden_states)
@@ -241,6 +263,7 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             do_sample: Optional[bool] = False,
             preallocated_kv_cache: Optional[object] = None,
             preallocated_aux_cache: Optional[object] = None,
+            return_scores: Optional[bool] = False,
         ) -> torch.LongTensor:
         """
         Generates a sequence of tokens from a given prompt. It can be used for both greedy and sampling-based decoding.
@@ -259,6 +282,7 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         # 每个 decode step 开始时
         
         output_sequence = input_ids
+        scores = [] if return_scores else None
 
         batch_size = input_ids.shape[0]
         embed_size_per_head = self.config.head_dim
@@ -269,34 +293,48 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         input_len = input_ids.shape[1]
         max_new_tokens = max_length - input_len
         # 限制最多生成200个新token（按你的dataset2maxlen来）
-        actual_max_length = input_len + min(max_new_tokens, 200)
-        if preallocated_kv_cache is not None:
+        max_new_tokens_capped = min(int(max_new_tokens), 200)
+        effective_max_length = int(input_len + max_new_tokens_capped)
+        # 以 effective_max_length 作为本次生成的真实上限，确保缓存分配/while 条件一致
+        max_length = effective_max_length
+        force_attn_fp32 = os.getenv("LAZYLLAMA_ATTN_FP32", "0") == "1"
+        if preallocated_kv_cache is not None and not force_attn_fp32:
             kv_cache = preallocated_kv_cache
             kv_cache.reset()
+            if int(kv_cache.size[2]) < int(effective_max_length):
+                raise ValueError(
+                    f"preallocated_kv_cache length={int(kv_cache.size[2])} is smaller than required max_length={int(effective_max_length)}. "
+                    "Increase MAX_SEQ_LEN (prompt+generation) or reduce max_length/max_gen."
+                )
         else:
             kv_cache = KVCache(
                 self.config.num_hidden_layers,
                 batch_size,
                 self.config.num_key_value_heads,
-                actual_max_length,
+                effective_max_length,
                 embed_size_per_head,
                 input_ids.device,
-                dtype=torch.float32
+                dtype=torch.float32 if force_attn_fp32 else torch.float32
             )
-        if preallocated_aux_cache is not None:
+        if preallocated_aux_cache is not None and not force_attn_fp32:
             aux_cache = preallocated_aux_cache
             aux_cache.reset()
+            if int(aux_cache.size[1]) < int(effective_max_length):
+                raise ValueError(
+                    f"preallocated_aux_cache length={int(aux_cache.size[1])} is smaller than required max_length={int(effective_max_length)}. "
+                    "Increase MAX_SEQ_LEN (prompt+generation) or reduce max_length/max_gen."
+                )
         else:
             aux_cache = AuxCache(
                 self.config.num_hidden_layers,
                 batch_size,
-                actual_max_length,
+                effective_max_length,
                 self.config.hidden_size,
                 input_ids.device,
-                dtype=torch.float32
+                dtype=torch.float32 if force_attn_fp32 else torch.float32
             )
-        print(f"KVCache dtype: {kv_cache.key_cache[0].dtype}")
-        print(f"AuxCache dtype: {aux_cache.cache[0].dtype}")
+        # print(f"KVCache dtype: {kv_cache.key_cache[0].dtype}")
+        # print(f"AuxCache dtype: {aux_cache.cache[0].dtype}")
         cache_position = torch.arange(input_ids.shape[1], device=input_ids.device)
 
         # Creating position_ids on the fly. The default value (for padding tokens) is 1
@@ -326,7 +364,7 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
                 # ← 加计时结束
                 torch.cuda.synchronize()
                 t_end = time.time()
-                # print(f"[step {'prefill' if is_prefill else len(decode_times)}] allocated: {torch.cuda.memory_allocated()/1024**3:.1f}GB, reserved: {torch.cuda.memory_reserved()/1024**3:.1f}GB")
+                print(f"[step {'prefill' if is_prefill else len(decode_times)}] allocated: {torch.cuda.memory_allocated()/1024**3:.1f}GB, reserved: {torch.cuda.memory_reserved()/1024**3:.1f}GB")
 
                 # ← 记录时间
                 if is_prefill:
@@ -335,7 +373,7 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
                     # print(f"[PREFILL TOP5] indices: {top5.indices}")
                     prefill_time = t_end - t_start
                     is_prefill = False
-                    # print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms, 输入tokens: {cache_position[-1].item()+1}")
+                    print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms, 输入tokens: {cache_position[-1].item()+1}")
                 else:
                     decode_times.append(t_end - t_start)
                 # if is_first_step:
@@ -343,11 +381,14 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
                 #     aux = model_inputs['aux_cache']
                 #     is_first_step = False
                 next_token_logits = outputs[0][:, -1, :].clone()
+                if return_scores:
+                    # 将当前步 logits 存起来，用于与 Baseline 精确对齐分析
+                    scores.append(next_token_logits.detach().cpu())
                 # 找到这段诊断代码，替换为：
                 if is_prefill or len(decode_times) < 2:
-                    print(f"[logits] max={next_token_logits.max().item():.2f}, min={next_token_logits.min().item():.2f}, has_nan={next_token_logits.isnan().any().item()}, has_inf={next_token_logits.isinf().any().item()}")
+                    # print(f"[logits] max={next_token_logits.max().item():.2f}, min={next_token_logits.min().item():.2f}, has_nan={next_token_logits.isnan().any().item()}, has_inf={next_token_logits.isinf().any().item()}")
                     top3 = torch.topk(next_token_logits[0], 3)
-                    print(f"[logits] top3 ids={top3.indices.tolist()}, vals={[f'{v:.2f}' for v in top3.values.tolist()]}")
+                    # print(f"[logits] top3 ids={top3.indices.tolist()}, vals={[f'{v:.2f}' for v in top3.values.tolist()]}")
                 next_token_scores = logits_processor(input_ids, next_token_logits)
                 
                 if do_sample:
@@ -399,6 +440,8 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
 
         import gc; gc.collect()
         torch.cuda.empty_cache()
+        if return_scores:
+            return output_sequence, scores
         return output_sequence
     
     def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
@@ -417,6 +460,10 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         model.load_state_dict(new_state_dict, assign=True)
         del new_state_dict
         import gc; gc.collect()
+
+        # meta -> to_empty 会让未出现在 state_dict 里的 buffer 处于未初始化状态。
+        # rotary_emb 的 inv_freq/cos/sin cache 属于 buffer，若不重建会导致 RoPE 输出 NaN。
+        model.model.rotary_emb = Qwen3RotaryEmbedding(config=model.config)
         
         return model
         

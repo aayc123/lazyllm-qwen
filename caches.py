@@ -83,16 +83,20 @@ class HFCache:
             in_kv_cache_idxs=None,   # ← 新增
             total_size=None,         # ← 新增
         ):
-        # shape: (batch_size, num_heads, sequence_length, embed_size_per_head)
+        # shape: (batch_size, num_heads, max_cache_len, embed_size_per_head)
+        # 这里的 max_cache_len 应该等于全局 KVCache 预分配的最大长度
         self.max_cache_len = shape[2]
         
         if preallocated_key is not None:
-            # ✅ 零拷贝：直接引用全局 KVCache 的 tensor
-            # 注意：这里是 view，不是 copy
-            self._key_cache = preallocated_key   # shape: (B, H, max_len, D)
+            # ✅ 引用全局 KVCache 的 tensor 作为底层存储
+            # 注意：它的第三维长度是全局 max_cache_len，而不是当前 step 的 total_size
+            self._key_cache = preallocated_key   # shape: (B, H, max_cache_len, D)
             self._value_cache = preallocated_value
+            # 当前已经在 KVCache 中的 token 数（由 Context 计算传入）
             self._current_len = in_kv_cache_idxs.shape[0]
-            self._total_size = total_size
+            # 逻辑上的“最大允许 token 索引范围”(max index + 1)。
+            # 不能用“有效 key 的数量”，因为剪枝会让 token 索引变稀疏（max_idx 可能远大于 key 数量）。
+            self._total_size = int(total_size) if total_size is not None else None
             self._in_kv_cache_idxs = in_kv_cache_idxs
         elif cache is None:
             self._key_cache = torch.zeros(shape, device=device,dtype=dtype)
@@ -121,21 +125,52 @@ class HFCache:
         value_states = value_states.to(self._value_cache.dtype)
         
         cache_position = cache_kwargs["cache_position"]
-        if key_states.shape[2] > 1:
-            print(f"[HFCache.update PREFILL] layer={layer_idx}")
-            print(f"  key_states.shape={key_states.shape}")
-            print(f"  cache_position.shape={cache_position.shape}, first5={cache_position[:5].tolist()}, last5={cache_position[-5:].tolist()}")
-            print(f"  _in_kv_cache_idxs.shape={self._in_kv_cache_idxs.shape}")
+        # 打印前几层的 KV 更新情况，确认是否所有层都在正确写入
+        if layer_idx < 3 and cache_position.shape[0] > 1:
+            print(f"[HFCache.update] layer={layer_idx}, cache_position={cache_position}, key_states.shape={key_states.shape}")
+        # if key_states.shape[2] > 1:
+        #     print(f"[HFCache.update PREFILL] layer={layer_idx}")
+        #     print(f"  key_states.shape={key_states.shape}")
+        #     print(f"  cache_position.shape={cache_position.shape}, first5={cache_position[:5].tolist()}, last5={cache_position[-5:].tolist()}")
+        #     print(f"  _in_kv_cache_idxs.shape={self._in_kv_cache_idxs.shape}")
         self._key_cache[:, :, cache_position, :] = key_states
         self._value_cache[:, :, cache_position, :] = value_states
 
         self._current_len += key_states.shape[2]
         self.seen_tokens = self._current_len
+
+        # 当前 KV 中有效的序列位置索引
         valid_idxs = torch.cat([self._in_kv_cache_idxs, cache_position])
+
+        # 仅在前几层和 prefill 阶段做索引健全性检查，避免刷屏/开销过大
+        if layer_idx < 3 and cache_position.shape[0] > 1:
+            num_total = valid_idxs.numel()
+            unique_idxs = torch.unique(valid_idxs)
+            num_unique = unique_idxs.numel()
+            num_dup = int(num_total - num_unique)
+            min_idx = int(valid_idxs.min()) if num_total > 0 else -1
+            max_idx = int(valid_idxs.max()) if num_total > 0 else -1
+            physical_max = int(self.max_cache_len - 1)
+            if hasattr(self, "_total_size") and self._total_size is not None:
+                logical_max = int(self._total_size - 1)
+                max_allowed = int(min(physical_max, logical_max))
+            else:
+                max_allowed = physical_max
+            print(
+                f"[HFCache.update idxcheck] layer={layer_idx}, total={num_total}, unique={num_unique}, "
+                f"dup={num_dup}, min_idx={min_idx}, max_idx={max_idx}, max_allowed={max_allowed}"
+            )
+            if (valid_idxs < 0).any() or (valid_idxs > max_allowed).any():
+                print(f"[HFCache.update WARNING] layer={layer_idx}, out-of-range index detected in valid_idxs")
+
         return self._key_cache[:, :, valid_idxs, :], self._value_cache[:, :, valid_idxs, :]
     
     def get_seq_length(self, layer_idx=0):
         return self._current_len
 
     def get_max_length(self):
-        return self._total_size if hasattr(self, '_total_size') else self.max_cache_len
+        # HF attention 会用 get_max_length() 来判断 cache_position 是否越界；
+        # 这里应该返回“允许的最大 token 索引范围”，受物理容量和逻辑序列长度共同约束。
+        if hasattr(self, "_total_size") and self._total_size is not None:
+            return int(min(self.max_cache_len, self._total_size))
+        return int(self.max_cache_len)
