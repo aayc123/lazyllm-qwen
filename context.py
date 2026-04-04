@@ -63,6 +63,79 @@ class Context:
         self._update_keys_idxs_to_tokens_idxs = True
         self._update_tkns_idxs_to_hidden_states_idxs = True
 
+        # 上一层写入的、按「绝对 token 位置」索引的重要性分数；NaN 表示尚未有分数（下一层预剪枝时视为保留）。
+        self.token_importance_prev = torch.full(
+            (max_sequence_length,), float("nan"), device=self.device, dtype=torch.float32
+        )
+
+    def save_pre_prune_drops_to_aux(self, drop_token_abs: torch.LongTensor, layer_idx: int) -> None:
+        """Save hidden states of pre-pruned tokens so get_aux_cache(layer_idx+1) can restore them.
+
+        Writes to aux_cache[layer_idx] (not layer_idx-1), because get_aux_cache(L) reads
+        aux_cache[L-1].  So tokens pruned at layer N entrance are found by layer N+1.
+        """
+        if drop_token_abs.numel() == 0:
+            return
+        aux_idx = layer_idx
+        if aux_idx >= self.aux_cache.n_layers:
+            return
+        # Only save tokens not already in the NEXT layer's KV or in this aux slot
+        next_layer = layer_idx + 1
+        if next_layer < self.kv_cache.n_layers:
+            in_kv = self.kv_cache.cache_status_bit_array[next_layer]
+        else:
+            in_kv = torch.zeros_like(self.selected_tokens_bit_array)
+        in_aux = self.aux_cache.cache_status_bit_array[aux_idx]
+        pruned_tokens_bit_array = torch.zeros_like(self.selected_tokens_bit_array)
+        pruned_tokens_bit_array[drop_token_abs] = True
+        to_add_to_aux_bit_array = torch.logical_and(
+            pruned_tokens_bit_array,
+            torch.logical_not(torch.logical_or(in_kv, in_aux)),
+        )
+        to_add_to_aux_idxs = torch.nonzero(to_add_to_aux_bit_array).view(-1)
+        if to_add_to_aux_idxs.numel() == 0:
+            return
+        aux_src = torch.index_select(
+            self.hidden_states, 1, self.tkns_idxs_to_hidden_states_idxs[to_add_to_aux_idxs]
+        )
+        if aux_src.dtype != self.aux_cache.cache[aux_idx].dtype:
+            aux_src = aux_src.to(self.aux_cache.cache[aux_idx].dtype)
+        self.aux_cache.cache_status_bit_array[aux_idx].logical_or_(to_add_to_aux_bit_array)
+        self.aux_cache.cache[aux_idx].index_copy_(1, to_add_to_aux_idxs, aux_src)
+
+    def apply_pre_prune_from_prev_importance(self, layer_idx: int, pruning_rate: float) -> None:
+        """
+        根据上一层 scatter 的 token_importance_prev，在进入本层 Q/K/V 前裁剪 hidden_states。
+        layer_idx==0 或 pruning_rate<=0 时不做；序列长度<=1 时不做。
+        """
+        if layer_idx == 0 or pruning_rate <= 0:
+            return
+        n = self.hidden_states_idxs.numel()
+        if n <= 1:
+            return
+        k_drop = int(pruning_rate * n)
+        k_drop = min(k_drop, n - 1)  # 至少保留 1 个 token（末 token 另用 inf 保护）
+        if k_drop <= 0:
+            return
+        scores = self.token_importance_prev[self.hidden_states_idxs.long()].clone()
+        scores = torch.nan_to_num(scores, nan=float("inf"))
+        last_t = self.sequence_length - 1
+        hi = self.tkns_idxs_to_hidden_states_idxs[last_t]
+        scores[hi] = float("inf")
+        keep_k = n - k_drop
+        _, keep_rel = torch.topk(scores, keep_k, largest=True)
+        keep_rel = torch.sort(keep_rel)[0]
+        keep_mask = torch.zeros(n, dtype=torch.bool, device=self.device)
+        keep_mask[keep_rel] = True
+        drop_mask = ~keep_mask
+        drop_abs = self.hidden_states_idxs[drop_mask]
+        self.save_pre_prune_drops_to_aux(drop_abs, layer_idx)
+        self.hidden_states = self.hidden_states[:, keep_rel, :]
+        self.hidden_states_idxs = self.hidden_states_idxs[keep_rel]
+        self.selected_tokens_bit_array[drop_abs] = False
+        self._update_keys_idxs_to_tokens_idxs = True
+        self._update_tkns_idxs_to_hidden_states_idxs = True
+
     @property
     def keys_idxs_to_tokens_idxs(self):
         """A mapping from the key's indexes to the token's indexes"""
@@ -135,16 +208,29 @@ class Context:
         return local_kv_cache
 
     def get_aux_cache(self, layer_idx: int):
-        """Updates the hidden states with the tokens from the Aux Cache"""
-        in_aux_cache_bit_array = torch.logical_and(
-            torch.logical_and(self.aux_cache.cache_status_bit_array[layer_idx-1], self.selected_tokens_bit_array), 
-            # Removing those tokens that are in KV Cache
-            torch.logical_not(self.in_kv_cache_bit_array)
-        )
+        """Updates the hidden states with the tokens from the Aux Cache.
+
+        Works in both prefill and decode phases:
+        - Prefill: restores tokens that are in aux cache, selected, but not in KV cache.
+        - Decode: same logic, but selected_tokens_bit_array covers all historical tokens
+          so we restore any pruned token that is not yet in this layer's KV cache.
+        """
+        is_decode = self.hidden_states.shape[1] == 1
+
+        if is_decode:
+            # Decode phase: consider all tokens currently tracked (selected_tokens_bit_array)
+            # that are in aux cache but NOT in this layer's KV cache.
+            in_aux_cache_bit_array = torch.logical_and(
+                self.aux_cache.cache_status_bit_array[layer_idx - 1],
+                torch.logical_not(self.in_kv_cache_bit_array)
+            )
+        else:
+            in_aux_cache_bit_array = torch.logical_and(
+                torch.logical_and(self.aux_cache.cache_status_bit_array[layer_idx-1], self.selected_tokens_bit_array),
+                # Removing those tokens that are in KV Cache
+                torch.logical_not(self.in_kv_cache_bit_array)
+            )
         in_aux_cache_idxs = torch.nonzero(in_aux_cache_bit_array).view(-1)
-        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
-        #     print(f"[get_aux_cache layer{layer_idx}] aux_cache_status: {self.aux_cache.cache_status_bit_array[layer_idx-1].sum()}")
-        #     print(f"[get_aux_cache layer{layer_idx}] in_aux_cache_idxs: {in_aux_cache_idxs}")
         
         self.hidden_states = torch.cat([
             self.hidden_states, 
@@ -160,8 +246,6 @@ class Context:
             )
         self._update_keys_idxs_to_tokens_idxs = True
         self._update_tkns_idxs_to_hidden_states_idxs = True
-        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
-        #     print(f"[get_aux_cache layer{layer_idx}] hidden_states_idxs after: {self.hidden_states_idxs}")
 
 
     @property
@@ -169,24 +253,13 @@ class Context:
         return self.tokens_positions_idxs[:, self.hidden_states_idxs]
 
     def update_kv_cache(self, local_kv_cache: HFCache, layer_idx: int, kv_cache_offset: int = None):
+        # HFCache.update() 已经把 K/V 直接写进了全局 preallocated buffer（同一块显存），
+        # 这里只需要更新 status bit，不再做重复的 index_copy_。
         in_hidden_states_bit_array = torch.logical_and(
             self.hidden_states_bit_array,
             torch.logical_not(self.kv_cache.cache_status_bit_array[layer_idx])
         )
         self.kv_cache.cache_status_bit_array[layer_idx].logical_or_(in_hidden_states_bit_array)
-        new_kv_cache_idxs = torch.nonzero(in_hidden_states_bit_array).view(-1)
-
-        # ← 改用 index_select，按真实位置取值
-        self.kv_cache.key_cache[layer_idx].index_copy_(
-            2,
-            new_kv_cache_idxs,
-            torch.index_select(local_kv_cache.key_cache[0], 2, new_kv_cache_idxs)
-        )
-        self.kv_cache.value_cache[layer_idx].index_copy_(
-            2,
-            new_kv_cache_idxs,
-            torch.index_select(local_kv_cache.value_cache[0], 2, new_kv_cache_idxs)
-        )
             
             
     '''只存那些：被剪掉 & 下一层KV Cache里没有 & Aux Cache里也没有的token'''
@@ -204,10 +277,6 @@ class Context:
             # Removing those tokens that are in the next layer's KV Cache and those that are already in the Aux Cache
             torch.logical_not(torch.logical_or(in_next_layer_kv_bit_array, in_aux_cache_bit_array))
         ) 
-        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
-        #     print(f"[update_aux_cache layer{layer_idx}] hidden_states.shape: {self.hidden_states.shape}")
-        #     print(f"[update_aux_cache layer{layer_idx}] in_next_layer_kv sum: {in_next_layer_kv_bit_array.sum()}")
-        #     print(f"[update_aux_cache layer{layer_idx}] in_aux_cache sum before: {in_aux_cache_bit_array.sum()}")
         self.aux_cache.cache_status_bit_array[layer_idx].logical_or_(to_add_to_aux_bit_array)
 
         to_add_to_aux_idxs = torch.nonzero(to_add_to_aux_bit_array).view(-1)
@@ -223,11 +292,6 @@ class Context:
             to_add_to_aux_idxs,
             aux_src
         )
-        # if self.hidden_states.shape[1] > 1 and layer_idx <= 3:
-        #     print(f"[update_aux_cache layer{layer_idx}] to_prune_idxs count: {to_prune_idxs.shape[0]}")
-        #     print(f"[update_aux_cache layer{layer_idx}] to_add_to_aux_idxs: {to_add_to_aux_idxs}")
-        #     print(f"[update_aux_cache layer{layer_idx}] aux status after: {self.aux_cache.cache_status_bit_array[layer_idx].sum()}")
-
 
     def prune(self, to_prune_idxs: torch.LongTensor):
         """Prunes the tokens from the hidden states"""

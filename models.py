@@ -88,17 +88,25 @@ class LazyQwen3Model(PreTrainedModel):
         is_decode = inputs_embeds.shape[1] == 1
 
         if is_decode:
-            # decode阶段：当前单token可以attend到所有past tokens
-            # shape: (batch, 1, 1, full_len)
-            causal_mask = torch.zeros(
-                (batch_size, 1, 1, mask_full_length),
+            # decode阶段：构造完整的因果 mask，形状 (batch, 1, full_len, full_len)。
+            # 虽然通常 query 只有 1 个新 token，但 decoder_layer 会从 Aux Cache 恢复历史 token，
+            # 恢复后 hidden_states 的 query 维度变大，需要在 query 维度做 index_select。
+            # 因此这里预先生成完整大小的下三角 mask，供 decoder_layer 按需切片。
+            causal_mask = torch.full(
+                (batch_size, 1, mask_full_length, mask_full_length),
+                fill_value=0.0,
                 dtype=torch.float32,
                 device=device,
             )
-            # padding位置mask掉
+            # 上三角部分（未来 token）设为 -1e4
+            causal_mask = causal_mask + torch.triu(
+                torch.full((mask_full_length, mask_full_length), -1e4, device=device),
+                diagonal=1,
+            )
+            # padding 位置 mask 掉
             if attention_mask is not None:
                 padding_mask = (attention_mask == 0).float() * -1e4  # (B, full_len)
-                causal_mask[:, :, 0, :] = padding_mask
+                causal_mask = causal_mask + padding_mask.unsqueeze(1).unsqueeze(2)
             use_sw = False
             sliding_window_mask = None
         else:
@@ -109,9 +117,25 @@ class LazyQwen3Model(PreTrainedModel):
                 cache_position=torch.arange(mask_full_length, device=device),
                 past_key_values=None,
             )
-            if causal_mask.dtype != torch.float32:
-                causal_mask = causal_mask.to(torch.float32)
-            causal_mask = causal_mask.clamp(min=-1e4)
+            if causal_mask is None:
+                # SDPA returns None when it can use is_causal internally;
+                # fall back to an explicit float32 lower-triangular mask so that
+                # decoder_layer's index_select on dims 2/3 always works.
+                causal_mask = torch.zeros(
+                    (batch_size, 1, mask_full_length, mask_full_length),
+                    dtype=torch.float32, device=device,
+                )
+                causal_mask = causal_mask + torch.triu(
+                    torch.full((mask_full_length, mask_full_length), -1e4, device=device),
+                    diagonal=1,
+                )
+                if attention_mask is not None:
+                    padding_mask = (attention_mask == 0).float() * -1e4
+                    causal_mask = causal_mask + padding_mask.unsqueeze(1).unsqueeze(2)
+            else:
+                if causal_mask.dtype != torch.float32:
+                    causal_mask = causal_mask.to(torch.float32)
+                causal_mask = causal_mask.clamp(min=-1e4)
             use_sw = (
                 hasattr(self.config, 'use_sliding_window') and
                 self.config.use_sliding_window and
@@ -127,9 +151,10 @@ class LazyQwen3Model(PreTrainedModel):
                     past_key_values=None,
                     sliding_window=self.config.sliding_window,
                 )
-                if sliding_window_mask.dtype != torch.float32:
-                    sliding_window_mask = sliding_window_mask.to(torch.float32)
-                sliding_window_mask = sliding_window_mask.clamp(min=-1e4)
+                if sliding_window_mask is not None:
+                    if sliding_window_mask.dtype != torch.float32:
+                        sliding_window_mask = sliding_window_mask.to(torch.float32)
+                    sliding_window_mask = sliding_window_mask.clamp(min=-1e4)
         if inputs_embeds.shape[1] > 1:
             print(f"[causal_mask] shape={causal_mask.shape}, ...")
         
@@ -264,7 +289,8 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             preallocated_kv_cache: Optional[object] = None,
             preallocated_aux_cache: Optional[object] = None,
             return_scores: Optional[bool] = False,
-        ) -> torch.LongTensor:
+            return_timings: Optional[bool] = False,
+        ) -> Union[torch.LongTensor, tuple]:
         """
         Generates a sequence of tokens from a given prompt. It can be used for both greedy and sampling-based decoding.
 
@@ -351,64 +377,46 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
             "output_attentions": output_attentions, 
         }
         unfinished_sequences = torch.ones(batch_size, dtype=torch.long, device=input_ids.device)
-        is_prefill = True  # ← 加这行
-        prefill_time = 0   # ← 加这行
-        decode_times = []  # ← 加这行
-        # is_first_step = True 
-        
+        is_prefill = True
+        prefill_time = 0.0
+        decode_times = []
+
+        evt_prefill_start = torch.cuda.Event(enable_timing=True)
+        evt_prefill_end = torch.cuda.Event(enable_timing=True)
+        evt_decode_start = torch.cuda.Event(enable_timing=True)
+        evt_decode_end = torch.cuda.Event(enable_timing=True)
+
         while cache_position[-1].item() < max_length and not torch.all(input_ids[:, -1] == eos_token_id):
-            torch.cuda.synchronize()
-            t_start = time.time()
+            if is_prefill:
+                evt_prefill_start.record()
+
             with torch.no_grad():
                 outputs = self(**model_inputs)
-                # ← 加计时结束
-                torch.cuda.synchronize()
-                t_end = time.time()
-                print(f"[step {'prefill' if is_prefill else len(decode_times)}] allocated: {torch.cuda.memory_allocated()/1024**3:.1f}GB, reserved: {torch.cuda.memory_reserved()/1024**3:.1f}GB")
 
-                # ← 记录时间
                 if is_prefill:
-                    top5 = torch.topk(outputs[0][:, -1, :], 5)
-                    # print(f"[PREFILL TOP5] values: {top5.values}")
-                    # print(f"[PREFILL TOP5] indices: {top5.indices}")
-                    prefill_time = t_end - t_start
+                    evt_prefill_end.record()
                     is_prefill = False
-                    print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms, 输入tokens: {cache_position[-1].item()+1}")
-                else:
-                    decode_times.append(t_end - t_start)
-                # if is_first_step:
-                #     kv = model_inputs['kv_cache']
-                #     aux = model_inputs['aux_cache']
-                #     is_first_step = False
+
                 next_token_logits = outputs[0][:, -1, :].clone()
                 if return_scores:
-                    # 将当前步 logits 存起来，用于与 Baseline 精确对齐分析
                     scores.append(next_token_logits.detach().cpu())
-                # 找到这段诊断代码，替换为：
-                if is_prefill or len(decode_times) < 2:
-                    # print(f"[logits] max={next_token_logits.max().item():.2f}, min={next_token_logits.min().item():.2f}, has_nan={next_token_logits.isnan().any().item()}, has_inf={next_token_logits.isinf().any().item()}")
-                    top3 = torch.topk(next_token_logits[0], 3)
-                    # print(f"[logits] top3 ids={top3.indices.tolist()}, vals={[f'{v:.2f}' for v in top3.values.tolist()]}")
                 next_token_scores = logits_processor(input_ids, next_token_logits)
-                
+
                 if do_sample:
                     probs = nn.functional.softmax(next_token_scores, dim=-1)
                     next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
                 else:
                     next_tokens = torch.argmax(next_token_scores, dim=-1)
 
-                # Finished sentences should have their next token be a padding token
                 next_tokens = next_tokens * unfinished_sequences + (1 - unfinished_sequences) * pad_token_id
-
                 unfinished_sequences.mul_(next_tokens != eos_token_id)
 
-                # Updating model inputs for the next generation step
-                input_ids = next_tokens.view(-1, 1) 
-                output_sequence = torch.cat([output_sequence, input_ids], dim=-1)             
+                input_ids = next_tokens.view(-1, 1)
+                output_sequence = torch.cat([output_sequence, input_ids], dim=-1)
                 cache_position = torch.tensor([cache_position[-1] + 1], device=cache_position.device)
                 attention_mask = torch.cat(
-                    [attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)], 
-                    dim=-1
+                    [attention_mask, torch.ones((batch_size, 1), device=attention_mask.device)],
+                    dim=-1,
                 )
                 position_ids = attention_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(attention_mask == 0, 1)
@@ -419,13 +427,13 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
                     "position_ids": position_ids,
                     "cache_position": cache_position,
                 })
-        if decode_times:
-            avg_decode = sum(decode_times) / len(decode_times) * 1000
-            total_decode = sum(decode_times) * 1000
-            print(f"[TIMER] Decode平均每token: {avg_decode:.1f}ms")
-            print(f"[TIMER] Decode总时间: {total_decode:.1f}ms, 共{len(decode_times)}个tokens")
-            print(f"[TIMER] Prefill时间(TTFT): {prefill_time*1000:.1f}ms")
-            print(f"[TIMER] 总时间(TTFT+Decode): {(prefill_time*1000+total_decode):.1f}ms")
+
+        evt_decode_end.record()
+        torch.cuda.synchronize()
+        prefill_time = evt_prefill_start.elapsed_time(evt_prefill_end) / 1000.0
+        total_wall = evt_prefill_start.elapsed_time(evt_decode_end) / 1000.0
+        n_decode_steps = max(0, output_sequence.shape[1] - input_len)
+        print(f"[TIMER] Prefill(TTFT): {prefill_time*1000:.1f}ms, Decode steps: {n_decode_steps}, Total: {total_wall*1000:.1f}ms")
             
         model_inputs.clear()
 
@@ -440,8 +448,22 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
 
         import gc; gc.collect()
         torch.cuda.empty_cache()
+
+        timings = None
+        if return_timings:
+            timings = {
+                "prefill_ms": float(prefill_time * 1000.0),
+                "decode_step_ms": [],
+                "total_generate_ms": float(total_wall * 1000.0),
+                "num_decode_steps": n_decode_steps,
+            }
+
+        if return_scores and return_timings:
+            return output_sequence, scores, timings
         if return_scores:
             return output_sequence, scores
+        if return_timings:
+            return output_sequence, timings
         return output_sequence
     
     def from_qwen3_state_dict(qwen3_state_dict, config, pruning_rates=None):
@@ -466,4 +488,3 @@ class LazyQwen3ForCausalLM(PreTrainedModel):
         model.model.rotary_emb = Qwen3RotaryEmbedding(config=model.config)
         
         return model
-        

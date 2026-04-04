@@ -1,0 +1,42 @@
+Task,ID,Prediction
+qa_1,0,"Based on the documents, the answer is France.
+Based on the documents, the answer is France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France. France"
+qa_1,1,"The Normans were in Normandy from the 10th century onwards, with the Duchy of Normandy established in 911 through the Treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and Rollo, a Viking leader. The region became a significant political and cultural entity, evolving into a powerful fiefdom under Norman rule, and their influence extended through various historical periods and conquests.
+The Normans were in Normandy from the 10th century onwards, with the Duchy of Normandy established in 911 through the Treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and Rollo, a Viking leader. The region became a significant political and cultural entity, evolving into a powerful fiefdom under Norman rule, and their influence extended through various historical periods and conquests."
+qa_1,2,"Denmark, Iceland, and Norway"
+qa_1,3,"Rollo
+Rollo is mentioned in the documents as the Norse leader. Specifically, Document 24 states that the Normans were descended from Norse raiders and pirates from Denmark, Iceland, and Norway who, under their leader Rollo, agreed to swear fealty to King Charles III of West Francia. This directly identifies Rollo as the Norse leader in question. Other documents also reference Rollo in the context of establishing the Duchy of Normandy, further confirming his role as the leader of the Norse settlers. No other Norse leader is explicitly named in the provided documents.
+Rollo"
+qa_1,4,"The Normans first gained their separate identity in the first half of the 10th century. This is stated in Document 24, which mentions that the distinct cultural and ethnic identity of the Normans emerged initially in the first half of the 10th century."
+qa_1,5,"William II of Normandy
+Based on the documents, the answer to the question ""Who was the duke in the battle of Hastings?"" is William II of Normandy. This is mentioned in Document 14, which states, ""In 1066, Duke William II of Normandy conquered England killing King Harold II at the Battle of Hastings."" Therefore, the answer is William II of Normandy."
+qa_1,6,before the Norman Conquest of England in 1066?
+qa_1,7,converted to after they settled in Normandy?
+qa_1,8,The answer should be in the form of a single word. The answer is in the given documents.
+qa_1,9,"The Latin version of the word Norman was first recorded in the 9th century as Nortmannus, Normannus, or Nordmannus.
+The Latin version of the word Norman was first recorded in the 9th century as Nortmannus, Normannus, or Nordmannus."
+qa_1,10,"The Duchy of Normandy was founded in the 10th century. The Duchy of Normandy was established by the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and the famed Viking ruler Rollo, and was situated in the former Frankish kingdom of Neustria. The treaty offered Rollo and his men the French lands between the river Epte and the Atlantic coast in exchange for their protection against further Viking incursions. The area corresponded to the northern part of present-day Upper Normandy down to the river Seine, but the Duchy would eventually extend west beyond the Seine. The territory was roughly equivalent to the old province of Rouen, and reproduced the Roman administrative structure of Gallia Lugdunensis II (part of the former Gallia Lugdunensis)."
+qa_1,11,King Charles III of West Francia
+qa_1,12,of Normandy? The answer should be a single word.
+qa_1,13,Rollo
+qa_1,14,"Christianity
+The Normans adopted Christianity, as evidenced by their conversion from Norse paganism. This is highlighted in Document 23, which mentions that the descendants of Rollo's Vikings replaced the Norse religion with Catholicism. Additionally, Document 24 states that the Normans adopted the Gallo-Romance language and converted to Catholicism, blending their Frankish heritage with Old Norse traditions. The adoption of Christianity is further supported by Document 3, which notes that the Normans became exponents of Catholic orthodoxy. These documents collectively indicate that the Norman religion was Christianity."
+qa_1,15,"Upper Normandy
+Based on the documents, the Normans were located in the northern part of present-day Upper Normandy down to the river Seine, as mentioned in Document 22. This area corresponds to the former Frankish kingdom of Neustria and was established as the Duchy of Normandy through the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and Rollo. The territory was roughly equivalent to the old province of Rouen and reproduced the Roman administrative structure of Gallia Lugdunensis II. Therefore, the answer is Upper Normandy. The Normans were located in the northern part of present-day Upper Normandy down to the river Seine, as stated in Document 22. This area was established as the Duchy of Normandy through the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and Rollo. The territory was roughly equivalent to the old province of Rouen and reproduced"
+qa_1,16,"One of the Norman's major exports was fighting horsemen.
+Based on the documents provided, one of the Norman's major exports was fighting horsemen. This is mentioned in Document 24, which states, ""Many Normans of Italy, France and England eventually served as avid Crusaders under the Italo-Norman prince Bohemund I and the Anglo-Norman king Richard the Lion-Heart."" Additionally, Document 24 also notes that ""by 1066 Normandy had been exporting fighting horsemen for more than a generation."" This indicates that the export of fighting horsemen was a significant aspect of Norman activity and trade. Other documents mention various aspects of Norman influence, such as architecture, military campaigns, and cultural integration, but the specific mention of exporting fighting horsemen is directly tied to their military and feudal structure. Therefore, the answer is that one of the Norman's major exports was fighting horsemen."
+qa_1,17,The answer should be in the form of a single word.
+qa_1,18,The answer should be in the format of a year or range of years.
+qa_1,19,1060s
+qa_1,20,"According to the documents, who was responsible for stopping him?"
+qa_1,21,The answer should be a single word. The answer is in the given documents.
+qa_1,22,"Raimbaud
+Okay, let's tackle this question. The user is asking, ""Who was the leader when the Franks entered the Euphrates valley?"""
+qa_1,23,The Normans teamed up with the Armenians in Anatolia.
+qa_1,24,"According to the documents, what was their ancestry?"
+qa_1,25,who drove the Byzantines out of southern Italy?
+qa_1,26,1082
+qa_1,27,"30,000"
+qa_1,28,Deabolis
+qa_1,29,"Bohemond
+Okay, let's see. The question is asking, ""Who was Robert's son?"" I need to find the answer based on the given documents. Let me go through the documents one by one to find any mentions of Robert and his son."

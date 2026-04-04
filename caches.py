@@ -120,49 +120,17 @@ class HFCache:
         self.seen_tokens = self._current_len
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs):
-        # 强制转换，防御性处理
         key_states = key_states.to(self._key_cache.dtype)
         value_states = value_states.to(self._value_cache.dtype)
-        
+
         cache_position = cache_kwargs["cache_position"]
-        # 打印前几层的 KV 更新情况，确认是否所有层都在正确写入
-        if layer_idx < 3 and cache_position.shape[0] > 1:
-            print(f"[HFCache.update] layer={layer_idx}, cache_position={cache_position}, key_states.shape={key_states.shape}")
-        # if key_states.shape[2] > 1:
-        #     print(f"[HFCache.update PREFILL] layer={layer_idx}")
-        #     print(f"  key_states.shape={key_states.shape}")
-        #     print(f"  cache_position.shape={cache_position.shape}, first5={cache_position[:5].tolist()}, last5={cache_position[-5:].tolist()}")
-        #     print(f"  _in_kv_cache_idxs.shape={self._in_kv_cache_idxs.shape}")
         self._key_cache[:, :, cache_position, :] = key_states
         self._value_cache[:, :, cache_position, :] = value_states
 
         self._current_len += key_states.shape[2]
         self.seen_tokens = self._current_len
 
-        # 当前 KV 中有效的序列位置索引
         valid_idxs = torch.cat([self._in_kv_cache_idxs, cache_position])
-
-        # 仅在前几层和 prefill 阶段做索引健全性检查，避免刷屏/开销过大
-        if layer_idx < 3 and cache_position.shape[0] > 1:
-            num_total = valid_idxs.numel()
-            unique_idxs = torch.unique(valid_idxs)
-            num_unique = unique_idxs.numel()
-            num_dup = int(num_total - num_unique)
-            min_idx = int(valid_idxs.min()) if num_total > 0 else -1
-            max_idx = int(valid_idxs.max()) if num_total > 0 else -1
-            physical_max = int(self.max_cache_len - 1)
-            if hasattr(self, "_total_size") and self._total_size is not None:
-                logical_max = int(self._total_size - 1)
-                max_allowed = int(min(physical_max, logical_max))
-            else:
-                max_allowed = physical_max
-            print(
-                f"[HFCache.update idxcheck] layer={layer_idx}, total={num_total}, unique={num_unique}, "
-                f"dup={num_dup}, min_idx={min_idx}, max_idx={max_idx}, max_allowed={max_allowed}"
-            )
-            if (valid_idxs < 0).any() or (valid_idxs > max_allowed).any():
-                print(f"[HFCache.update WARNING] layer={layer_idx}, out-of-range index detected in valid_idxs")
-
         return self._key_cache[:, :, valid_idxs, :], self._value_cache[:, :, valid_idxs, :]
     
     def get_seq_length(self, layer_idx=0):

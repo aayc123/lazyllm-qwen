@@ -1,0 +1,42 @@
+Task,ID,Prediction
+qa_1,0,"Based on the documents, the answer is France.
+Based on the documents, the answer is France."
+qa_1,1,"The Normans were in Normandy from the 10th century onwards, with the Duchy of Normandy established in 911 through the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and Rollo, a Viking leader. The region was initially a fiefdom and later expanded, becoming a significant feudal territory in medieval France.
+The Normans were in Normandy from the 10th century onwards, with the Duchy of Normandy established in 911 through the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and Rollo, a Viking leader. The region was initially a fiefdom and later expanded, becoming a significant feudal territory in medieval France."
+qa_1,2,"Denmark, Iceland, and Norway"
+qa_1,3,"Rollo
+Based on the documents provided, the answer to the question ""Who was the Norse leader?"" is Rollo. This is indicated in Document 24, which states that the Normans were descended from Norse raiders and pirates from Denmark, Iceland, and Norway who, under their leader Rollo, agreed to swear fealty to King Charles III of West Francia. Additionally, Document 6 mentions that the Duchy of Normandy was established by the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and the famed Viking ruler Rollo. These documents clearly identify Rollo as the Norse leader in question."
+qa_1,4,"The Normans first gained their separate identity in the first half of the 10th century.
+The Normans first gained their separate identity in the first half of the 10th century. The answer is derived from Document 24, which states that the distinct cultural and ethnic identity of the Normans emerged initially in the first half of the 10th century. This is the key information needed to answer the question accurately. Other documents mention various events related to the Normans, such as their involvement in the Crusades, their conquests, and their cultural developments, but none provide the specific information about the emergence of their separate identity. Therefore, the answer is based on Document 24. The answer is: The first half of the 10th century. The answer is: The first half of the 10th century. The answer is: The first half of the 10th century. The answer is: The first half of the"
+qa_1,5,"William II of Normandy
+Based on the documents, the answer to the question ""Who was the duke in the battle of Hastings?"" is William II of Normandy. This is mentioned in Document 14, which states, ""In 1066, Duke William II of Normandy conquered England killing King Harold II at the Battle of Hastings."" Additionally, Document 24 also refers to William the Conqueror leading the Norman conquest of England at the Battle of Hastings in 1066. Therefore, the correct answer is William II of Normandy."
+qa_1,6,before the Norman Conquest of England in 1066?
+qa_1,7,assimilated into?
+qa_1,8,The answer should be in the form of a single word. The answer is in the given documents.
+qa_1,9,"Medieval Latin, 9th century
+The Latin version of the word ""Norman"" was first recorded in Medieval Latin in the 9th century. This is indicated by the etymology provided in Document 15, which states that the English name ""Normans"" comes from the French words Normans/Normanz, plural of Normant, modern French normand, which is itself borrowed from Old Low Franconian Nortmann ""Northman"" or directly from Old Norse Norðmaðr, Latinized variously as Nortmannus, Normannus, or Nordmannus (recorded in Medieval Latin, 9th century) to mean ""Norseman, Viking."" The key phrase here is ""recorded in Medieval Latin, 9th century,"" which directly answers the question about when the Latin version of the word was first recorded. Other documents do not provide information about the Latin recording of the term ""Norman."" Therefore, the"
+qa_1,10,"The Duchy of Normandy was founded in the 10th century. The Duchy of Normandy was established by the treaty of Saint-Clair-sur-Epte between King Charles III of West Francia and the famed Viking ruler Rollo. The area corresponded to the northern part of present-day Upper Normandy down to the river Seine, but the Duchy would eventually extend west beyond the Seine. The territory was roughly equivalent to the old province of Rouen, and reproduced the Roman administrative structure of Gallia Lugdunensis II (part of the former Gallia Lugdunensis)."
+qa_1,11,King Charles III of West Francia
+qa_1,12,of Normandy?
+qa_1,13,Rollo
+qa_1,14,"Christianity
+The Normans adopted Christianity, as evidenced by their assimilation into the Catholic orthodoxy. This is highlighted in Document 3, which states that the Normans became exponents of the Catholic orthodoxy. Additionally, Document 24 mentions that the descendants of Rollo's Vikings replaced the Norse religion with Catholicism (Christianity). These documents collectively indicate that the Norman religion was Christianity."
+qa_1,15,"Upper Normandy
+Based on the documents, the Duchy of Normandy was established in the area corresponding to the northern part of present-day Upper Normandy down to the river Seine. This is mentioned in Document 22, which states that the territory was roughly equivalent to the old province of Rouen and reproduced the Roman administrative structure of Gallia Lugdunensis II. Therefore, the Normans were located in Upper Normandy. The answer is Upper Normandy. The Normans were located in Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The answer is Upper Normandy. The"
+qa_1,16,"One of the Norman's major exports was fighting horsemen.
+Based on the documents provided, one of the Norman's major exports was fighting horsemen. This is mentioned in Document 24, which states that ""Many Normans of Italy, France and England eventually served as avid Crusaders under the Italo-Norman prince Bohemond I and the Anglo-Norman king Richard the Lion-Heart."" Additionally, Document 24 also notes that ""Normandy had been exporting fighting horsemen for more than a generation."" This indicates that the export of fighting horsemen was a significant aspect of Norman activity and trade. Other documents also mention the Normans' involvement in military campaigns and their role as mercenaries, further supporting the idea that their military prowess and the export of warriors were key aspects of their exports. Therefore, the answer is that one of the Norman's major exports was fighting horsemen."
+qa_1,17,The answer should be in the form of a single word.
+qa_1,18,The answer should be in the format of a year or range of years.
+qa_1,19,1060s
+qa_1,20,"According to the documents, who was responsible for stopping him?"
+qa_1,21,The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the name of the castle. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the name of the castle. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the name of the castle. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the form of a list. The answer should be in the name of the castle. The answer should be in the form of a list. The answer should
+qa_1,22,"Raimbaud
+Okay, let's tackle this question. The user is asking, ""Who was the leader when the Franks entered the Euphrates valley?"""
+qa_1,23,The Normans teamed up with the Armenians in Anatolia.
+qa_1,24,"According to the documents, what was their ancestry?"
+qa_1,25,who drove the Byzantines out of southern Italy?
+qa_1,26,The answer is 1082.
+qa_1,27,"30,000"
+qa_1,28,Deabolis
+qa_1,29,"Bohemond
+Okay, let's see. The question is asking, ""Who was Robert's son?"" I need to find the answer based on the given documents. Let me go through the documents one by one to find any mentions of Robert and his son."
